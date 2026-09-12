@@ -1,7 +1,7 @@
 import type { PluginTimelineItemProps } from "@getpaseo/plugin/client";
 import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
-import type { UsageStatsData } from "../shared/usageStats";
+import { formatDuration, type UsageStatsData } from "../shared/usageStats";
 
 function formatTokens(n: number | undefined): string {
   if (n === undefined) return "—";
@@ -108,7 +108,7 @@ export function UsageStatsCard({
     footerParts.push(`First word ${d.firstWordSeconds}s`);
   }
   if (d.allTimeSeconds !== undefined) {
-    footerParts.push(`All time ${d.allTimeSeconds}s`);
+    footerParts.push(`All time ${formatDuration(d.allTimeSeconds)}`);
   }
 
   if (!expanded) {

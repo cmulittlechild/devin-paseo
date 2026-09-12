@@ -591,6 +591,15 @@ DEVIN_MODES = [
 ]
 
 
+def _format_duration(seconds: float) -> str:
+    s = max(0, int(round(seconds)))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
 def _process_cmdline(pid: int) -> str:
     """Best-effort command line for a PID (macOS/Linux). Empty on failure."""
     try:
@@ -2294,7 +2303,7 @@ class Supervisor:
         if turn.first_update_at is not None:
             ttft = max(0.0, turn.first_update_at - turn.started_at)
             lines.append(f"First word  {ttft:.1f}s")
-        lines.append(f"All time  {elapsed:.0f}s")
+        lines.append(f"All time  {_format_duration(elapsed)}")
         self.send_notification(turn.external_session_id, {
             "sessionUpdate": "tool_call",
             "toolCallId": f"usage-{turn.upstream_request_id}",

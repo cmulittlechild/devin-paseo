@@ -79,11 +79,34 @@ export function parseUsageStatsText(text: string): UsageStatsData | undefined {
       data.firstWordSeconds = Number(m[1]);
       continue;
     }
-    m = line.match(/^All time\s+([\d.]+)s/);
+    m = line.match(/^All time\s+(.+)$/);
     if (m) {
-      data.allTimeSeconds = Number(m[1]);
+      data.allTimeSeconds = parseDuration(m[1]);
       continue;
     }
   }
   return Object.keys(data).length > 0 ? data : undefined;
+}
+
+/** Parse "12h 5m", "3m 20s", "42s" into seconds. */
+export function parseDuration(text: string): number | undefined {
+  const t = text.trim();
+  let total = 0;
+  let matched = false;
+  const re = /(\d+(?:\.\d+)?)\s*(h|m|s)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) !== null) {
+    matched = true;
+    const v = Number(m[1]);
+    total += m[2] === "h" ? v * 3600 : m[2] === "m" ? v * 60 : v;
+  }
+  return matched ? total : undefined;
+}
+
+/** Format seconds as "12h 5m", "3m 20s", or "42s". */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
