@@ -103,10 +103,10 @@ export function parseDuration(text: string): number | undefined {
   return matched ? total : undefined;
 }
 
-/** Format seconds as "12h 5m", "3m 20s", or "42s". */
+/** Format seconds as "12h 5m 3s", "3m 20s", or "42s". */
 export function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));
   if (s < 60) return `${s}s`;
   if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
-  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 }
