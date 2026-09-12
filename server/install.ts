@@ -86,6 +86,16 @@ export function installSupervisor(): { path: string; changed: boolean } {
   return { path: target, changed };
 }
 
+/** Devin CLI config the supervisor passes via --config. */
+function ensureDevinConfig(): void {
+  const path = join(homedir(), ".config", "devin", "paseo-acp-config.json");
+  if (existsSync(path)) {
+    return;
+  }
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({ version: 1 }));
+}
+
 /** Find the generic ACP adapter inside the installed @getpaseo/server. */
 export function findAcpAdapter(): string | null {
   const rel = join("dist", "server", "server", "agent", "providers", "acp-agent.js");
@@ -181,6 +191,7 @@ export async function runDevinSetup(): Promise<DevinSetupStatus> {
   if (installed.changed) {
     reasons.push("supervisor updated");
   }
+  ensureDevinConfig();
 
   const providerChanged = ensureProviderConfig(installed.path);
   if (providerChanged) {

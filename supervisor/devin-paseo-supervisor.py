@@ -890,9 +890,24 @@ def _version_key(path_obj: Path) -> Tuple:
 
 
 def _resolve_real_devin() -> str:
-    override = os.environ.get("DEVIN_SUPERVISOR_REAL", "/root/.local/bin/devin-real")
+    override = os.environ.get("DEVIN_SUPERVISOR_REAL")
     if override:
         return override
+    for name in ("devin-real", "devin"):
+        found = shutil.which(name)
+        if found:
+            return found
+    # Devin Desktop remote installs land under ~/.devin-server/bin/<hash>/...
+    server_bins = sorted(
+        Path.home().glob(".devin-server/bin/*/extensions/windsurf/devin/bin/devin"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if server_bins:
+        return str(server_bins[0])
+    for candidate in (Path.home() / ".local" / "bin" / "devin-real", Path.home() / ".local" / "bin" / "devin"):
+        if candidate.exists():
+            return str(candidate)
     current = DEVIN_VERSIONS_DIR / "current" / "bin" / "devin"
     if current.exists():
         return str(current)
@@ -906,7 +921,7 @@ def _resolve_real_devin() -> str:
                 candidates.append(candidate)
     if candidates:
         return str(sorted(candidates, key=_version_key)[-1])
-    raise FileNotFoundError(f"No Devin CLI binary found under {DEVIN_VERSIONS_DIR}")
+    raise FileNotFoundError("No Devin CLI binary found (PATH, ~/.devin-server, ~/.local/bin, versions dir)")
 
 
 REAL_DEVIN = _resolve_real_devin()
