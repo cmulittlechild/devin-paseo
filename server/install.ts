@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import { createRequire } from "node:module";
@@ -98,9 +99,33 @@ export function findAcpAdapter(): string | null {
   } catch {
     // fall through to well-known paths
   }
+  // Resolve via the paseo CLI's own location — its bin symlink points into
+  // the npm-global node_modules that also holds @getpaseo/server.
+  for (const bin of [
+    join(homedir(), ".npm-global", "bin", "paseo"),
+    join(homedir(), ".local", "bin", "paseo"),
+    "/usr/bin/paseo",
+    "/usr/local/bin/paseo",
+    process.env.PASEO_CLI ?? "",
+  ]) {
+    try {
+      if (!bin || !existsSync(bin)) continue;
+      let dir = dirname(realpathSync(bin));
+      for (let i = 0; i < 6; i += 1) {
+        const candidate = join(dir, "node_modules", "@getpaseo", "server", rel);
+        if (existsSync(candidate)) {
+          return candidate;
+        }
+        dir = dirname(dir);
+      }
+    } catch {
+      // try next candidate
+    }
+  }
   for (const root of [
     "/usr/lib/node_modules/@getpaseo/server",
     "/usr/local/lib/node_modules/@getpaseo/server",
+    join(homedir(), ".npm-global", "lib", "node_modules", "@getpaseo", "server"),
     join(homedir(), ".npm", "lib", "node_modules", "@getpaseo", "server"),
   ]) {
     const candidate = join(root, rel);
