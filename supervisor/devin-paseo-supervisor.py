@@ -2248,11 +2248,23 @@ class Supervisor:
         session = self._get_session(turn.external_session_id)
         lu = (session or {}).get("lastUsage") or {}
         meta = lu.get("_meta") or {}
-        inp = meta.get("cognition.ai/inputTokens")
-        out = meta.get("cognition.ai/outputTokens")
-        cached = meta.get("cognition.ai/cachedReadTokens")
         used = lu.get("used")
         size = lu.get("size")
+        # Session-cumulative token totals (Devin Desktop semantics: sum of all
+        # model requests in the session, not just the final one).
+        totals = (session or {}).get("usageTotals") or {}
+        requests = totals.get("requests")
+        if requests:
+            inp = totals.get("input")
+            out = totals.get("output")
+            cached = totals.get("cached")
+        else:
+            # Sessions that predate cumulative tracking: fall back to the
+            # last request's usage like before.
+            inp = meta.get("cognition.ai/inputTokens")
+            out = meta.get("cognition.ai/outputTokens")
+            cached = meta.get("cognition.ai/cachedReadTokens")
+            requests = None
         if inp is None and out is None and used is None:
             return
         elapsed = max(0.0, time.time() - (turn.started_at or time.time()))
@@ -2272,6 +2284,8 @@ class Supervisor:
             lines.append(f"Thinking tokens  ~{thinking_est:,} (est.)")
         if cached is not None:
             lines.append(f"Cached tokens  {cached:,}")
+        if requests:
+            lines.append(f"Requests  {requests:,}")
         if used is not None:
             ctx = f"{used:,} / {size:,}" if size else f"{used:,}"
             if size:
@@ -2918,6 +2932,26 @@ class Supervisor:
                 _sess = self._get_session(turn.external_session_id)
                 if _sess is not None:
                     _sess["lastUsage"] = dict(update)
+                    # Accumulate per-session totals across every request —
+                    # Devin emits one usage_update per model call and Paseo
+                    # shows session-cumulative stats like Devin Desktop.
+                    _meta = update.get("_meta") or {}
+                    _key = (
+                        _meta.get("cognition.ai/inputTokens"),
+                        _meta.get("cognition.ai/outputTokens"),
+                        _meta.get("cognition.ai/cachedReadTokens"),
+                        update.get("used"),
+                    )
+                    if _key != _sess.get("_lastUsageKey") and any(v is not None for v in _key):
+                        _sess["_lastUsageKey"] = _key
+                        totals = _sess.setdefault(
+                            "usageTotals",
+                            {"input": 0, "output": 0, "cached": 0, "requests": 0},
+                        )
+                        totals["input"] += _key[0] or 0
+                        totals["output"] += _key[1] or 0
+                        totals["cached"] += _key[2] or 0
+                        totals["requests"] += 1
             # Track tool results for grounding guardrail.
             # Only track on terminal status (completed/failed), not in_progress,
             # which is an intermediate chunk that may carry no content.

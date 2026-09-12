@@ -185,6 +185,14 @@ export function UsageStatsCard({
               mutedColor={theme.colors.foregroundMuted}
               fgColor={theme.colors.foreground}
             />
+            {d.requests !== undefined ? (
+              <StatCell
+                label="Requests"
+                value={formatTokens(d.requests)}
+                mutedColor={theme.colors.foregroundMuted}
+                fgColor={theme.colors.foreground}
+              />
+            ) : null}
           </View>
       {footerParts.length > 0 ? (
         <>
