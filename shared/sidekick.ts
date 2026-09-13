@@ -1,6 +1,9 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
+/** Default fusion sidekick — free tier, sane pairing for every lead family. */
+export const DEFAULT_SIDEKICK = "swe-2-medium";
+
 /** Current sidekick + available options for a fusion Devin agent. */
 export const devinSidekickInfo = defineRpc({
   name: "devin.sidekick_info",
