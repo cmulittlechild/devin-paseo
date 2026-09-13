@@ -1953,6 +1953,13 @@ class Turn:
     had_agent_message: bool = False
     auto_resume_injected: bool = False
     auto_resume_count: int = 0
+    # Per-turn token accumulation: sum of this turn's model requests
+    # (Devin Desktop "Response statistics" semantics — totals per user
+    # message, not per session).
+    usage_key: tuple = ()
+    usage_totals: dict = dataclasses.field(
+        default_factory=lambda: {"input": 0, "output": 0, "cached": 0, "requests": 0}
+    )
 
     def is_cancelled(self) -> bool:
         return self.cancel_sent or self.phase == TurnPhase.CANCELLED
@@ -2259,9 +2266,9 @@ class Supervisor:
         meta = lu.get("_meta") or {}
         used = lu.get("used")
         size = lu.get("size")
-        # Session-cumulative token totals (Devin Desktop semantics: sum of all
-        # model requests in the session, not just the final one).
-        totals = (session or {}).get("usageTotals") or {}
+        # Per-turn token totals (Devin Desktop semantics: sum of all model
+        # requests made while processing this one user message).
+        totals = turn.usage_totals
         requests = totals.get("requests")
         if requests:
             inp = totals.get("input")
@@ -2941,9 +2948,9 @@ class Supervisor:
                 _sess = self._get_session(turn.external_session_id)
                 if _sess is not None:
                     _sess["lastUsage"] = dict(update)
-                    # Accumulate per-session totals across every request —
-                    # Devin emits one usage_update per model call and Paseo
-                    # shows session-cumulative stats like Devin Desktop.
+                    # Accumulate per-turn totals — Devin emits one
+                    # usage_update per model call (sometimes duplicated);
+                    # dedupe identical consecutive reports.
                     _meta = update.get("_meta") or {}
                     _key = (
                         _meta.get("cognition.ai/inputTokens"),
@@ -2951,16 +2958,12 @@ class Supervisor:
                         _meta.get("cognition.ai/cachedReadTokens"),
                         update.get("used"),
                     )
-                    if _key != _sess.get("_lastUsageKey") and any(v is not None for v in _key):
-                        _sess["_lastUsageKey"] = _key
-                        totals = _sess.setdefault(
-                            "usageTotals",
-                            {"input": 0, "output": 0, "cached": 0, "requests": 0},
-                        )
-                        totals["input"] += _key[0] or 0
-                        totals["output"] += _key[1] or 0
-                        totals["cached"] += _key[2] or 0
-                        totals["requests"] += 1
+                    if _key != turn.usage_key and any(v is not None for v in _key):
+                        turn.usage_key = _key
+                        turn.usage_totals["input"] += _key[0] or 0
+                        turn.usage_totals["output"] += _key[1] or 0
+                        turn.usage_totals["cached"] += _key[2] or 0
+                        turn.usage_totals["requests"] += 1
             # Track tool results for grounding guardrail.
             # Only track on terminal status (completed/failed), not in_progress,
             # which is an intermediate chunk that may carry no content.
