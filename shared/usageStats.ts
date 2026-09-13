@@ -9,6 +9,17 @@ export const usageStatsData = z.object({
   thinkingTokens: z.number().optional(),
   cachedTokens: z.number().optional(),
   requests: z.number().optional(),
+  delegated: z
+    .array(
+      z.object({
+        label: z.string(),
+        inputTokens: z.number().optional(),
+        outputTokens: z.number().optional(),
+        cachedTokens: z.number().optional(),
+        requests: z.number().optional(),
+      }),
+    )
+    .optional(),
   sessionInputTokens: z.number().optional(),
   sessionOutputTokens: z.number().optional(),
   sessionCachedTokens: z.number().optional(),
@@ -64,6 +75,19 @@ export function parseUsageStatsText(text: string): UsageStatsData | undefined {
     m = line.match(/^Requests\s+([\d,]+)/);
     if (m) {
       data.requests = parseCount(m[1]);
+      continue;
+    }
+    m = line.match(
+      /^((?:Sidekick|Subagent)(?:\s+.+?)?)\s{2}input\s+([\d,]+)\s*·\s*output\s+([\d,]+)\s*·\s*cached\s+([\d,]+)\s*·\s*([\d,]+)\s*requests/,
+    );
+    if (m) {
+      (data.delegated ??= []).push({
+        label: m[1].trim(),
+        inputTokens: parseCount(m[2]),
+        outputTokens: parseCount(m[3]),
+        cachedTokens: parseCount(m[4]),
+        requests: parseCount(m[5]),
+      });
       continue;
     }
     m = line.match(

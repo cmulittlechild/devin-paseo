@@ -194,6 +194,19 @@ export function UsageStatsCard({
               />
             ) : null}
           </View>
+      {d.delegated?.length ? (
+        <>
+          <View style={styles.divider} />
+          {d.delegated.map((s) => (
+            <Text key={s.label} style={styles.footer}>
+              {`${s.label}  ${formatTokens(s.inputTokens)} in · ` +
+                `${formatTokens(s.outputTokens)} out · ` +
+                `${formatTokens(s.cachedTokens)} cached · ` +
+                `${formatTokens(s.requests)} requests`}
+            </Text>
+          ))}
+        </>
+      ) : null}
       {d.sessionRequests !== undefined ? (
         <>
           <View style={styles.divider} />
