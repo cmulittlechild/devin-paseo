@@ -172,6 +172,24 @@ const PATCHES: Patch[] = [
                 }`,
   },
   {
+    // Forward the configured model into the listFeatures probe session so a
+    // fusion model exposes its sidekick select before the first prompt.
+    id: "probe-model",
+    find: `            const response = await this.runACPRequest(() => probe.connection.newSession({
+                cwd: config.cwd,
+                mcpServers: [],
+            }));`,
+    replace: `            const response = await this.runACPRequest(() => probe.connection.newSession({
+                cwd: config.cwd,
+                mcpServers: [],
+                // devin/sidekick-probe: probe with the configured model so
+                // fusion sessions expose the sidekick select pre-prompt.
+                ...(config.model && /devin-supervisor/.test(JSON.stringify(this.runtimeSettings?.command ?? ""))
+                    ? { model: config.model }
+                    : {}),
+            }));`,
+  },
+  {
     // Forward ACP usage_update notifications as usage_updated events.
     id: "usage-update",
     find: `    handleUsageUpdate(update) {
@@ -287,18 +305,22 @@ export function patchAcpAdapter(adapterPath: string): PatchResult {
       errors: [`cannot read ${adapterPath}: ${String(error)}`],
     };
   }
-  if (source.includes(MARKER)) {
-    return { applied: true, alreadyApplied: true, changed: false, errors: [] };
-  }
   const errors: string[] = [];
   let next = source;
+  let changedAny = false;
   for (const patch of PATCHES) {
+    // Per-patch idempotency: a patch whose replacement is already present
+    // is skipped; a missing anchor is only an error when it was never applied.
+    if (next.includes(patch.replace)) {
+      continue;
+    }
     if (patch.all) {
       if (!next.includes(patch.find)) {
         errors.push(`${patch.id}: anchor not found`);
         continue;
       }
       next = next.split(patch.find).join(patch.replace);
+      changedAny = true;
     } else {
       const idx = next.indexOf(patch.find);
       if (idx < 0) {
@@ -306,7 +328,11 @@ export function patchAcpAdapter(adapterPath: string): PatchResult {
         continue;
       }
       next = next.slice(0, idx) + patch.replace + next.slice(idx + patch.find.length);
+      changedAny = true;
     }
+  }
+  if (!changedAny) {
+    return { applied: true, alreadyApplied: errors.length === 0, changed: false, errors };
   }
   if (errors.length > 0) {
     return { applied: false, alreadyApplied: false, changed: false, errors };
