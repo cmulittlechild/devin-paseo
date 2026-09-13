@@ -206,6 +206,75 @@ export interface PatchResult {
   changed: boolean;
 }
 
+const COPILOT_MARKER = "devin/sidekick";
+
+const COPILOT_PATCHES: Patch[] = [
+  {
+    id: "sidekick-feature-option",
+    // Declare a dynamic "Sidekick" feature select. Paseo only renders
+    // config options that are declared per-provider as featureOptions —
+    // generic categories never reach the UI.
+    find: `export const COPILOT_AGENT_FEATURE_OPTION = {`,
+    replace: `// devin/sidekick: extra feature select for Devin fusion sessions
+export const DEVIN_SIDEKICK_FEATURE_OPTION = {
+    id: "sidekick",
+    configId: "sidekick",
+    category: "sidekick",
+    label: "Sidekick",
+    description: "Fusion sidekick model",
+    tooltip: "Select fusion sidekick model",
+    emptyOptionLabel: "Default",
+};
+export const COPILOT_AGENT_FEATURE_OPTION = {`,
+  },
+  {
+    id: "sidekick-feature-register",
+    find: `            configFeatureOptions: [COPILOT_AGENT_FEATURE_OPTION],`,
+    replace: `            configFeatureOptions: [COPILOT_AGENT_FEATURE_OPTION, DEVIN_SIDEKICK_FEATURE_OPTION],`,
+  },
+];
+
+export function patchCopilotAdapter(adapterPath: string): PatchResult {
+  let source: string;
+  try {
+    source = readFileSync(adapterPath, "utf8");
+  } catch (error) {
+    return {
+      applied: false,
+      alreadyApplied: false,
+      changed: false,
+      errors: [`cannot read ${adapterPath}: ${String(error)}`],
+    };
+  }
+  if (source.includes(COPILOT_MARKER)) {
+    return { applied: true, alreadyApplied: true, changed: false, errors: [] };
+  }
+  const errors: string[] = [];
+  let next = source;
+  for (const patch of COPILOT_PATCHES) {
+    const idx = next.indexOf(patch.find);
+    if (idx < 0) {
+      errors.push(`${patch.id}: anchor not found`);
+      continue;
+    }
+    next = next.slice(0, idx) + patch.replace + next.slice(idx + patch.find.length);
+  }
+  if (errors.length > 0) {
+    return { applied: false, alreadyApplied: false, changed: false, errors };
+  }
+  try {
+    writeFileSync(adapterPath, next);
+  } catch (error) {
+    return {
+      applied: false,
+      alreadyApplied: false,
+      changed: false,
+      errors: [`cannot write ${adapterPath}: ${String(error)}`],
+    };
+  }
+  return { applied: true, alreadyApplied: false, changed: true, errors: [] };
+}
+
 export function patchAcpAdapter(adapterPath: string): PatchResult {
   let source: string;
   try {

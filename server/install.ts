@@ -10,7 +10,7 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawn } from "node:child_process";
-import { patchAcpAdapter } from "./patcher";
+import { patchAcpAdapter, patchCopilotAdapter } from "./patcher";
 import { SUPERVISOR_SOURCE_B64 } from "./supervisor-source";
 import type { DevinSetupStatus } from "../shared/setup";
 
@@ -207,6 +207,12 @@ export async function runDevinSetup(): Promise<DevinSetupStatus> {
     errors.push(...result.errors);
     if (result.changed) {
       reasons.push("ACP adapter patched — restart the daemon to activate");
+    }
+    const copilotPath = join(dirname(adapterPath), "copilot-acp-agent.js");
+    const copilotResult = patchCopilotAdapter(copilotPath);
+    errors.push(...copilotResult.errors);
+    if (copilotResult.changed) {
+      reasons.push("copilot adapter patched (sidekick select) — restart the daemon to activate");
     }
   } else {
     errors.push("@getpaseo/server ACP adapter not found");

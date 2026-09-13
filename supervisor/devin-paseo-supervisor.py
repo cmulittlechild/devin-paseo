@@ -1410,7 +1410,7 @@ def _select_option_sidekick(fam: dict, current: Optional[str]) -> dict:
     return {
         "id": "sidekick",
         "name": "Sidekick",
-        "category": "model",
+        "category": "sidekick",
         "type": "select",
         "currentValue": cur or "",
         "options": [{"value": s, "name": s, "description": ""} for s in sks],
@@ -1510,7 +1510,7 @@ def _merge_structured_config_options(config_options: Optional[List[dict]], model
         if not (
             isinstance(option, dict)
             and option.get("id") in ("mode", "model", "effort", "sidekick")
-            and option.get("category") in (None, "mode", "model", "thought_level")
+            and option.get("category") in (None, "mode", "model", "thought_level", "sidekick")
         )
     ]
     result.extend(_structured_config_options(model, mode, effort, feature_values, sidekick))
