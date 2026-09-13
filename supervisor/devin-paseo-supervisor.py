@@ -1132,7 +1132,9 @@ def get_cached_models() -> List[dict]:
     cached = load_cache().get("models", [])
     merged: List[dict] = []
     seen = set()
-    for model in list(DEVIN_MODELS) + list(cached):
+    # Live-fetched entries (with real variant_map/ids) take precedence over
+    # the static fallback table.
+    for model in list(cached) + list(DEVIN_MODELS):
         model_id = model.get("id") or model.get("modelId") or model.get("model")
         if not isinstance(model_id, str) or not model_id or model_id in seen:
             continue
@@ -1142,29 +1144,83 @@ def get_cached_models() -> List[dict]:
 
 
 
-_EFFORT_SUFFIX_RE = re.compile(r'-(low|medium|high|xhigh|max)$')
+_EFFORT_SUFFIX_RE = re.compile(r'-(none|minimal|low|medium|high|xhigh|max|thinking)$')
+
+DEFAULT_EFFORT = "medium"
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+_FUSION_ID_RE = re.compile(
+    r'^fusion-(?P<lead>.+?)-(?P<eff>none|minimal|low|medium|high|xhigh|max)(?P<fast>-fast)?-sidekick-(?P<sk>.+)$'
+)
+_SIDEKICK_PREF = [
+    "swe-2-medium", "swe-2-high", "swe-1-7-medium",
+    "gpt-5-6-luna-high", "gpt-5-6-sol-high", "glm-5-2",
+]
 
 
 def _model_family(model_id: str) -> str:
     return _EFFORT_SUFFIX_RE.sub('', model_id or '')
 
 
-def _resolve_model(base: str, effort: Optional[str]) -> str:
-    """Map (base family, effort) to a real Devin model id.
-
-    Devin's concrete model ids use dashes inside version numbers
-    (family "gpt-5.6-luna" -> id "gpt-5-6-luna-max"), and effort-suffixed
-    ids are mandatory — a bare family name 404s with "Resource not found".
-    """
-    if not base:
-        return base
-    fam = None
+def _family_entry(base: str) -> Optional[dict]:
+    """Find the cached family whose id is `base` (dot/dash normalized)."""
     for m in get_cached_models():
         mid = m.get("id")
         if mid == base or (mid and mid.replace(".", "-") == base):
-            fam = m
-            base = mid
-            break
+            return m
+    return None
+
+
+def _family_for_model_id(model_id: str) -> Optional[dict]:
+    """Find the family that owns a concrete (or family) model id."""
+    if not model_id:
+        return None
+    for m in get_cached_models():
+        if model_id == m.get("id"):
+            return m
+        if model_id in (m.get("variant_map") or {}).values():
+            return m
+        for sks in (m.get("pairs") or {}).values():
+            if model_id in sks.values():
+                return m
+    for m in get_cached_models():
+        mid = m.get("id")
+        if mid and model_id.startswith(mid.replace(".", "-") + "-"):
+            return m
+    return None
+
+
+def _default_sidekick(avail: List[str]) -> Optional[str]:
+    for pref in _SIDEKICK_PREF:
+        if pref in avail:
+            return pref
+    return sorted(avail)[0] if avail else None
+
+
+def _resolve_model(base: str, effort: Optional[str], sidekick: Optional[str] = None) -> str:
+    """Map (family, effort[, sidekick]) to a real Devin model id.
+
+    Concrete ids are looked up in the family's real variant table (parsed
+    from `devin models list`) — never guessed by string concat, since some
+    families use private ids (MODEL_*), reversed names (claude-5-fable-*),
+    or fusion lead/sidekick combos.
+    """
+    if not base:
+        return base
+    fam = _family_entry(base) or _family_for_model_id(base)
+    if fam and fam.get("fusion"):
+        pairs = fam.get("pairs") or {}
+        eff = effort if effort in pairs else (DEFAULT_EFFORT if DEFAULT_EFFORT in pairs else next(iter(pairs), None))
+        sks = pairs.get(eff) or {}
+        sk = sidekick if sidekick in sks else _default_sidekick(list(sks))
+        return sks.get(sk) or next(iter(sks.values()), base)
+    vm = (fam or {}).get("variant_map") or {}
+    if vm:
+        # already-concrete id with no new effort requested -> keep it
+        if base in vm.values() and (not effort or effort == _label_for_variant(fam, base)):
+            return base
+        eff = effort if effort in vm else (DEFAULT_EFFORT if DEFAULT_EFFORT in vm else next(iter(vm)))
+        return vm.get(eff) or base
     efforts = (fam or {}).get("efforts") or []
     e = effort if effort in efforts else (DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else (efforts[0] if efforts else None))
     if e and e in EFFORTS:
@@ -1172,15 +1228,140 @@ def _resolve_model(base: str, effort: Optional[str]) -> str:
     return base
 
 
+def _label_for_variant(fam: dict, model_id: str) -> Optional[str]:
+    for label, mid in (fam.get("variant_map") or {}).items():
+        if mid == model_id:
+            return label
+    if fam.get("fusion"):
+        m = _FUSION_ID_RE.match(model_id or '')
+        if m:
+            return m.group("eff")
+    return None
+
+
 def _split_model_id(model_id: str) -> Tuple[str, Optional[str]]:
+    fam = _family_for_model_id(model_id)
+    if fam:
+        return fam["id"], _label_for_variant(fam, model_id)
     m = _EFFORT_SUFFIX_RE.search(model_id or '')
     if m:
         return model_id[:m.start()], m.group(1)
     return model_id or '', None
 
 
-DEFAULT_EFFORT = "medium"
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+def _effort_label(mid: str, prefix: str, dispname: str) -> str:
+    """Derive the effort label for a concrete model id."""
+    if prefix and mid.startswith(prefix + "-"):
+        return mid[len(prefix) + 1:]
+    if mid == prefix or not prefix:
+        hay = re.sub(r'[^A-Z]', '', (dispname or '').upper())
+    else:
+        hay = re.sub(r'[^A-Z]', '', (mid + ' ' + (dispname or '')).upper())
+    for kw, label in (
+        ("NOTHINKING", "none"), ("NONE", "none"), ("MINIMAL", "minimal"),
+        ("XHIGH", "xhigh"), ("MEDIUM", "medium"), ("LOW", "low"),
+        ("HIGH", "high"), ("MAX", "max"), ("THINKING", "thinking"),
+    ):
+        if kw in hay:
+            return label
+    return "standard"
+
+
+def _effort_sort_key(label: str) -> int:
+    try:
+        return EFFORTS.index(label)
+    except ValueError:
+        return len(EFFORTS)
+
+
+def _parse_models_list(text: str) -> List[dict]:
+    """Parse `devin models list` output into family entries with variant maps."""
+    families: List[dict] = []
+    fam = None
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        if not raw.startswith(" "):
+            m = re.match(r"^(.*?)\s*\(([^()]+)\)\s*$", raw.strip())
+            fam = None
+            if m and re.match(r'^[a-z0-9._-]+$', m.group(2)):
+                fam = {"id": m.group(2), "name": m.group(1).strip(),
+                       "description": "", "ids": [], "names": {}}
+                families.append(fam)
+            continue
+        if fam is None:
+            continue
+        parts = raw.split()
+        if not parts or parts[0] == "aliases:":
+            continue
+        mid, name = parts[0], " ".join(parts[1:]).split("[")[0].strip()
+        fam["ids"].append(mid)
+        fam["names"][mid] = name
+        if not fam["description"] and "[" in raw:
+            fam["description"] = name + "  [" + raw.split("[", 1)[1].strip()
+    out = []
+    for fam in families:
+        if not fam["ids"]:
+            continue
+        prefix = fam["id"].replace(".", "-")
+        efforts: List[str] = []
+        vmap: dict = {}
+        for mid in fam["ids"]:
+            label = _effort_label(mid, prefix, fam["names"].get(mid, ""))
+            vmap.setdefault(label, mid)
+            if not re.search(r'-(fast|priority)$', label) and label not in efforts:
+                efforts.append(label)
+        efforts.sort(key=_effort_sort_key)
+        out.append({
+            "id": fam["id"], "name": fam["name"], "description": fam["description"],
+            "efforts": efforts, "variant_map": vmap, "ids": fam["ids"],
+        })
+    return out
+
+
+def _expand_fusion(entries: List[dict]) -> List[dict]:
+    """Split the flat `fusion` family into `fusion/<lead>` pseudo-families
+    with per-lead effort levels and sidekick lists."""
+    fusion = next((e for e in entries if e.get("id") == "fusion"), None)
+    if not fusion:
+        return entries
+    groups: dict = {}
+    for mid in fusion.get("ids") or []:
+        m = _FUSION_ID_RE.match(mid)
+        if not m:
+            continue
+        lead, eff, fast, sk = m.group("lead"), m.group("eff"), m.group("fast"), m.group("sk")
+        bucket = groups.setdefault(lead, {}).setdefault(eff, {})
+        if sk not in bucket or not fast:
+            bucket[sk] = mid if not fast else bucket.get(sk) or mid
+    entries = [e for e in entries if e.get("id") != "fusion"]
+    for lead, effs in groups.items():
+        efforts = sorted(effs, key=_effort_sort_key)
+        sks = sorted({sk for m in effs.values() for sk in m})
+        entries.append({
+            "id": f"fusion/{lead}", "name": f"Fusion: {lead}",
+            "description": f"Fusion lead {lead} + sidekick",
+            "efforts": efforts, "sidekicks": sks, "pairs": effs,
+            "fusion": True, "ids": [i for m in effs.values() for i in m.values()],
+        })
+    return entries
+
+
+def _fetch_live_models() -> Optional[List[dict]]:
+    """Build the model table from `devin models list`; None on failure."""
+    try:
+        out = subprocess.run([REAL_DEVIN, "models", "list"], capture_output=True, text=True, timeout=25)
+        if out.returncode != 0:
+            _log(f"MODELS_FETCH rc={out.returncode} err={out.stderr.strip()[:200]}")
+            return None
+        entries = _expand_fusion(_parse_models_list(out.stdout))
+        if not entries:
+            return None
+        _log(f"MODELS_FETCH ok families={len(entries)}")
+        return entries
+    except Exception as exc:
+        _log(f"MODELS_FETCH failed exc={exc}")
+        return None
 
 
 def get_model_families() -> List[dict]:
@@ -1209,11 +1390,7 @@ def _acp_model_state(current_model: Optional[str] = None) -> dict:
 
 
 def _select_option_from_efforts(model_id: str, current_effort: Optional[str]) -> dict:
-    fam = None
-    for m in get_cached_models():
-        if m.get("id") == _model_family(model_id):
-            fam = m
-            break
+    fam = _family_for_model_id(model_id) or _family_entry(_model_family(model_id))
     efforts = (fam or {}).get("efforts") or list(EFFORTS)
     options = [{"value": e, "name": e.title(), "description": ""} for e in efforts]
     cur = current_effort or (DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else efforts[0])
@@ -1224,6 +1401,19 @@ def _select_option_from_efforts(model_id: str, current_effort: Optional[str]) ->
         "type": "select",
         "currentValue": cur,
         "options": options,
+    }
+
+
+def _select_option_sidekick(fam: dict, current: Optional[str]) -> dict:
+    sks = (fam or {}).get("sidekicks") or []
+    cur = current if current in sks else _default_sidekick(sks)
+    return {
+        "id": "sidekick",
+        "name": "Sidekick",
+        "category": "model",
+        "type": "select",
+        "currentValue": cur or "",
+        "options": [{"value": s, "name": s, "description": ""} for s in sks],
     }
 
 def get_cached_modes() -> List[dict]:
@@ -1298,28 +1488,32 @@ def _feature_select_options(feature_values: Optional[dict] = None) -> List[dict]
     ]
 
 
-def _structured_config_options(model: str, mode: str, effort: Optional[str] = None, feature_values: Optional[dict] = None) -> List[dict]:
+def _structured_config_options(model: str, mode: str, effort: Optional[str] = None, feature_values: Optional[dict] = None, sidekick: Optional[str] = None) -> List[dict]:
     base, cur_effort = _split_model_id(model)
     if effort:
         cur_effort = effort
-    return [
+    options = [
         _select_option_from_modes(get_cached_modes(), mode),
         _select_option_from_models(get_cached_models(), base),
         _select_option_from_efforts(base, cur_effort),
-        *_feature_select_options(feature_values),
     ]
+    fam = _family_entry(base) or _family_for_model_id(model)
+    if fam and fam.get("fusion"):
+        options.append(_select_option_sidekick(fam, sidekick))
+    options.extend(_feature_select_options(feature_values))
+    return options
 
 
-def _merge_structured_config_options(config_options: Optional[List[dict]], model: str, mode: str, effort: Optional[str] = None, feature_values: Optional[dict] = None) -> List[dict]:
+def _merge_structured_config_options(config_options: Optional[List[dict]], model: str, mode: str, effort: Optional[str] = None, feature_values: Optional[dict] = None, sidekick: Optional[str] = None) -> List[dict]:
     result = [
         option for option in (config_options or [])
         if not (
             isinstance(option, dict)
-            and option.get("id") in ("mode", "model", "effort")
+            and option.get("id") in ("mode", "model", "effort", "sidekick")
             and option.get("category") in (None, "mode", "model", "thought_level")
         )
     ]
-    result.extend(_structured_config_options(model, mode, effort, feature_values))
+    result.extend(_structured_config_options(model, mode, effort, feature_values, sidekick))
     return result
 
 
@@ -2372,7 +2566,7 @@ class Supervisor:
         return {
             "sessionId": external_id,
             "modes": {"currentModeId": DEFAULT_DEVIN_MODE, "availableModes": get_cached_modes()},
-            "configOptions": _structured_config_options(model, DEFAULT_DEVIN_MODE, feature_values=session.get("featureValues")),
+            "configOptions": _structured_config_options(model, DEFAULT_DEVIN_MODE, feature_values=session.get("featureValues"), sidekick=session.get("sidekick")),
             "models": _acp_model_state(model),
         }
 
@@ -2432,13 +2626,19 @@ class Supervisor:
             except Exception as exc:
                 _log(f"FORCE_MODE {method} failed real={real_sid} mode={mode} exc={exc}")
 
-    def _force_native_model(self, child: NativeChild, real_sid: str, model: Optional[str], effort: Optional[str] = None) -> None:
+    def _force_native_model(self, child: NativeChild, real_sid: str, model: Optional[str], effort: Optional[str] = None, sidekick: Optional[str] = None) -> None:
         if not model:
             return
-        # Devin's set_config_option expects a full effort-suffixed id
-        # (e.g. "swe-2-max"); bare families like "swe-2" fail with
-        # "Resource not found".
-        model = _resolve_model(_model_family(model), _split_model_id(model)[1] or effort)
+        # Devin's set_config_option expects a concrete variant id
+        # (e.g. "swe-2-max", "gpt-5-6-luna-max", MODEL_GPT_5_2_HIGH or a
+        # fusion-...-sidekick-... combo); bare families 404.
+        fam = _family_for_model_id(model)
+        concrete = fam is not None and (
+            model in (fam.get("variant_map") or {}).values()
+            or any(model in sks.values() for sks in (fam.get("pairs") or {}).values())
+        )
+        if not concrete:
+            model = _resolve_model(_model_family(model), _split_model_id(model)[1] or effort, sidekick)
         req = {
             "jsonrpc": "2.0",
             "id": self.next_id(),
@@ -2665,7 +2865,7 @@ class Supervisor:
                     "externalId": external_id,
                     "realId": None,
                     "cwd": (params or {}).get("cwd", str(Path.home())),
-                    "model": _resolve_model(_model_family((params or {}).get("model", "swe-2")), (params or {}).get("effort") or DEFAULT_EFFORT),
+                    "model": _resolve_model(_model_family((params or {}).get("model", "swe-2")), (params or {}).get("effort") or DEFAULT_EFFORT, (params or {}).get("sidekick")),
                     "mode": DEFAULT_DEVIN_MODE,
                     "title": None,
                     "createdAt": time.time(),
@@ -2677,7 +2877,8 @@ class Supervisor:
                 if params.get("cwd"):
                     session["cwd"] = params["cwd"]
                 if params.get("model"):
-                    session["model"] = _resolve_model(_model_family(params["model"].split("/",1)[-1]), _split_model_id(params["model"])[1])
+                    _pm = params["model"] if params["model"].startswith("fusion/") else params["model"].split("/",1)[-1]
+                    session["model"] = _resolve_model(_model_family(_pm), _split_model_id(_pm)[1], session.get("sidekick"))
                 session["mode"] = DEFAULT_DEVIN_MODE
                 session["updatedAt"] = time.time()
             return session
@@ -2820,8 +3021,10 @@ class Supervisor:
         if cache_valid():
             return
         _log("CACHE_REFRESH start")
-        # Use static model/mode lists since native ACP doesn't expose them
-        models = DEVIN_MODELS
+        # Model table comes from `devin models list` (real variant ids,
+        # incl. MODEL_* private names and fusion combos); static list is
+        # only a fallback. Modes stay static — ACP doesn't expose them.
+        models = _fetch_live_models() or DEVIN_MODELS
         modes = DEVIN_MODES
         with_cache(lambda cache: cache.update({
             "models": models,
@@ -2876,7 +3079,7 @@ class Supervisor:
                     real_sid = new_res["result"]["sessionId"]
                     session["realId"] = real_sid
                     child.real_session_id = real_sid
-                    self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
+                    self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
                     self._persist_session(turn.external_session_id)
                 else:
@@ -2914,7 +3117,7 @@ class Supervisor:
             load_res = self._send_rpc(child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
             if "result" in load_res:
                 child.real_session_id = real_sid
-                self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
+                self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                 self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
                 _log(
                     f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_OK external={turn.external_session_id} "
@@ -2930,7 +3133,7 @@ class Supervisor:
                 turn.mark_failed()
                 return False
         turn.child = child
-        self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
+        self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
         self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
         if turn.is_cancelled():
             _log(f"NATIVE_PROMPT_CANCELLED_AFTER_CHILD external={turn.external_session_id} pid={child.proc.pid}")
@@ -3028,6 +3231,7 @@ class Supervisor:
                         _sess.get("model", "swe-2-medium"),
                         _sess.get("mode", DEFAULT_DEVIN_MODE),
                         feature_values=_sess.get("featureValues"),
+                        sidekick=_sess.get("sidekick"),
                     )
             # Buffer the last thought chunk so we can ensure the final
             # session/update before turn completion is never a thinking bubble.
@@ -3258,7 +3462,7 @@ class Supervisor:
                         load_res = self._send_rpc(resume_child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
                         if "result" in load_res:
                             _log(f"NATIVE_PROMPT RESUMED from sessions.db for external={turn.external_session_id} real={real_sid}")
-                            self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"))
+                            self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                             self._force_native_mode(resume_child, real_sid, DEFAULT_DEVIN_MODE)
                             self.pool.release(resume_child, real_sid)
                             turn.mark_failed()
@@ -3277,7 +3481,7 @@ class Supervisor:
                                 new_real_sid = new_res["result"]["sessionId"]
                                 session["realId"] = new_real_sid
                                 fresh_child.real_session_id = new_real_sid
-                                self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"))
+                                self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                                 self._force_native_mode(fresh_child, new_real_sid, DEFAULT_DEVIN_MODE)
                                 self._persist_session(turn.external_session_id)
                                 self.pool.release(fresh_child, new_real_sid)
@@ -3656,7 +3860,7 @@ class Supervisor:
                     session["realId"] = real_id
                     child.real_session_id = real_id
                     # Apply model/mode
-                    self._force_native_model(child, real_id, session.get("model"), session.get("effort"))
+                    self._force_native_model(child, real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, real_id, DEFAULT_DEVIN_MODE)
                     result = dict(res["result"])
                     result["sessionId"] = external_id
@@ -3668,6 +3872,7 @@ class Supervisor:
                         session.get("model", "swe-2-medium"),
                         DEFAULT_DEVIN_MODE,
                         feature_values=session.get("featureValues"),
+                        sidekick=session.get("sidekick"),
                     )
                     result["models"] = _acp_model_state(session.get("model", "swe-2-medium"))
                     self._persist_session(external_id)
@@ -3686,7 +3891,7 @@ class Supervisor:
         self.send_result(req_id, {
             "sessionId": external_id,
             "modes": {"currentModeId": session["mode"], "availableModes": get_cached_modes()},
-            "configOptions": _structured_config_options(session["model"], session["mode"], feature_values=session.get("featureValues")),
+            "configOptions": _structured_config_options(session["model"], session["mode"], feature_values=session.get("featureValues"), sidekick=session.get("sidekick")),
             "models": _acp_model_state(session["model"]),
         })
         self._persist_session(external_id)
@@ -3727,7 +3932,7 @@ class Supervisor:
                 if "result" in res:
                     _log(f"session/load OK for external={external_id} real={session['realId']}")
                     session["mode"] = DEFAULT_DEVIN_MODE
-                    self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"))
+                    self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
                     self.pool.release(child, session["realId"])
                     self.send_result(req_id, self._session_result(external_id, session))
@@ -3748,7 +3953,7 @@ class Supervisor:
                             if "result" in retry_res:
                                 _log(f"session/load RESUMED from sessions.db for external={external_id} real={session['realId']}")
                                 session["mode"] = DEFAULT_DEVIN_MODE
-                                self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"))
+                                self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
                                 self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
                                 self.pool.release(child, session["realId"])
                                 self.send_result(req_id, self._session_result(external_id, session))
@@ -3775,7 +3980,7 @@ class Supervisor:
                             new_real_id = new_res["result"]["sessionId"]
                             session["realId"] = new_real_id
                             child.real_session_id = new_real_id
-                            self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"))
+                            self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                             self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
                             self.send_result(req_id, self._session_result(external_id, session))
                             self._persist_session(external_id)
@@ -3811,7 +4016,7 @@ class Supervisor:
                     new_real_id = new_res["result"]["sessionId"]
                     session["realId"] = new_real_id
                     child.real_session_id = new_real_id
-                    self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"))
+                    self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
                 else:
                     _log(f"session/load fresh create failed: {new_res.get('error')}")
@@ -4217,10 +4422,11 @@ class Supervisor:
         else:
             model = params.get("modelId") or params.get("model") or "swe-2"
         # Strip provider prefix if Paseo sends "devin/xxx"
-        if "/" in model:
+        # ("fusion/<lead>" is a real family id — never strip that one)
+        if "/" in model and not model.startswith("fusion/"):
             model = model.split("/", 1)[1]
         base, tier = _split_model_id(model)
-        session["model"] = _resolve_model(base, tier or session.get("effort"))
+        session["model"] = _resolve_model(base, tier or session.get("effort"), session.get("sidekick"))
         session["effort"] = tier or session.get("effort") or DEFAULT_EFFORT
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
@@ -4249,7 +4455,7 @@ class Supervisor:
         effort = params.get("value") or params.get("effort") or DEFAULT_EFFORT
         base, _ = _split_model_id(session.get("model") or "swe-2")
         session["effort"] = effort
-        session["model"] = _resolve_model(base, effort)
+        session["model"] = _resolve_model(base, effort, session.get("sidekick"))
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
             child = self.pool.acquire(session["realId"])
@@ -4259,6 +4465,31 @@ class Supervisor:
                 self.pool.release(child, session["realId"])
             except Exception as exc:
                 _log(f"SET_EFFORT RPC failed real={session.get('realId')} model={model}: {exc}")
+                self.pool.release(child)
+        self.send_result(req_id, self._session_result(external_id, session))
+        self._persist_session(external_id)
+
+
+    def handle_session_set_sidekick(self, req_id: Any, params: dict) -> None:
+        """Fusion sessions: pick the sidekick model, then re-resolve the
+        concrete fusion-<lead>-<eff>-sidekick-<sk> id and push it."""
+        external_id = params.get("sessionId")
+        session = self._get_session(external_id)
+        if not session:
+            self.send_error(req_id, -32001, f"Unknown session '{external_id}'")
+            return
+        session["sidekick"] = params.get("value") or params.get("sidekick")
+        base, tier = _split_model_id(session.get("model") or "")
+        session["model"] = _resolve_model(base, tier or session.get("effort"), session["sidekick"])
+        model = session["model"]
+        if session.get("realId") and self._mode_preference == "native":
+            child = self.pool.acquire(session["realId"])
+            try:
+                req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/set_config_option", "params": {"sessionId": session["realId"], "configId": "model", "value": model}}
+                self._send_rpc(child, req, timeout=10)
+                self.pool.release(child, session["realId"])
+            except Exception as exc:
+                _log(f"SET_SIDEKICK RPC failed real={session.get('realId')} model={model}: {exc}")
                 self.pool.release(child)
         self.send_result(req_id, self._session_result(external_id, session))
         self._persist_session(external_id)
@@ -5019,6 +5250,8 @@ class Supervisor:
                         self.handle_session_set_mode(req_id, params)
                     elif config_id == "effort":
                         self.handle_session_set_effort(req_id, params)
+                    elif config_id == "sidekick":
+                        self.handle_session_set_sidekick(req_id, params)
                     else:
                         self.handle_session_set_feature(req_id, params, config_id)
                 elif method == "session/delete":
@@ -5139,6 +5372,8 @@ class Supervisor:
                                 self.handle_session_set_mode(req_id, params)
                             elif config_id == "effort":
                                 self.handle_session_set_effort(req_id, params)
+                            elif config_id == "sidekick":
+                                self.handle_session_set_sidekick(req_id, params)
                             else:
                                 self.handle_session_set_feature(req_id, params, config_id)
                         elif method == "session/delete":
