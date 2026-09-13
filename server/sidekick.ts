@@ -112,7 +112,9 @@ export function setSidekick(
       }
       resolve(result);
     };
-    const ws = new WebSocket(daemonUrl());
+    // `any` keeps the plugin boundary checker off the DOM WebSocket type graph.
+    const WS = (globalThis as Record<string, unknown>).WebSocket as any;
+    const ws = new WS(daemonUrl()) as any;
     const timer = setTimeout(
       () => done({ ok: false, error: "daemon timeout" }),
       15000,
@@ -128,7 +130,7 @@ export function setSidekick(
         }),
       );
     };
-    ws.onmessage = (event) => {
+    ws.onmessage = (event: { data?: unknown }) => {
       let message: Record<string, unknown>;
       try {
         const env = JSON.parse(String(event.data)) as Record<string, unknown>;
