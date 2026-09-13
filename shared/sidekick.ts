@@ -11,7 +11,13 @@ export const devinSidekickInfo = defineRpc({
   output: z.object({
     fusion: z.boolean(),
     sidekick: z.string().nullable(),
-    options: z.array(z.string()),
+    options: z.array(
+      z.object({
+        id: z.string(),
+        label: z.string(),
+        description: z.string().optional(),
+      }),
+    ),
   }),
 });
 

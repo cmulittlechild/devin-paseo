@@ -1297,6 +1297,9 @@ def _parse_models_list(text: str) -> List[dict]:
         mid, name = parts[0], " ".join(parts[1:]).split("[")[0].strip()
         fam["ids"].append(mid)
         fam["names"][mid] = name
+        fam.setdefault("descs", {})[mid] = (
+            raw.split("[", 1)[1].rstrip("]").strip() if "[" in raw else ""
+        )
         if not fam["description"] and "[" in raw:
             fam["description"] = name + "  [" + raw.split("[", 1)[1].strip()
     out = []
@@ -1315,6 +1318,7 @@ def _parse_models_list(text: str) -> List[dict]:
         out.append({
             "id": fam["id"], "name": fam["name"], "description": fam["description"],
             "efforts": efforts, "variant_map": vmap, "ids": fam["ids"],
+            "descs": fam.get("descs") or {},
         })
     return out
 
@@ -1334,14 +1338,36 @@ def _expand_fusion(entries: List[dict]) -> List[dict]:
         bucket = groups.setdefault(lead, {}).setdefault(eff, {})
         if sk not in bucket or not fast:
             bucket[sk] = mid if not fast else bucket.get(sk) or mid
+    descs = fusion.get("descs") or {}
     entries = [e for e in entries if e.get("id") != "fusion"]
     for lead, effs in groups.items():
         efforts = sorted(effs, key=_effort_sort_key)
         sks = sorted({sk for m in effs.values() for sk in m})
+        # Per-combo descriptions carry a "Sidekick input/output" price segment
+        # only when the sidekick is billed — absence means the sidekick is free.
+        sk_labels: dict = {}
+        for sk in sks:
+            label, detail = "Free", ""
+            for mid in (m[sk] for m in effs.values() if sk in m):
+                desc = descs.get(mid, "")
+                m_in = re.search(r'\$([0-9.]+) / 1M Sidekick input', desc)
+                m_out = re.search(r'\$([0-9.]+) / 1M Sidekick output', desc)
+                if m_in:
+                    label = f"+${m_in.group(1)}/1M"
+                    parts = [f"Sidekick input ${m_in.group(1)}/1M"]
+                    m_cached = re.search(r'\$([0-9.]+) / 1M Sidekick cached input', desc)
+                    if m_cached:
+                        parts.append(f"cached ${m_cached.group(1)}/1M")
+                    if m_out:
+                        parts.append(f"output ${m_out.group(1)}/1M")
+                    detail = " · ".join(parts)
+                    break
+            sk_labels[sk] = {"name": f"{sk} · {label}", "description": detail}
         entries.append({
             "id": f"fusion/{lead}", "name": f"Fusion: {lead}",
             "description": f"Fusion lead {lead} + sidekick",
             "efforts": efforts, "sidekicks": sks, "pairs": effs,
+            "sidekick_labels": sk_labels,
             "fusion": True, "ids": [i for m in effs.values() for i in m.values()],
         })
     return entries
@@ -1406,6 +1432,7 @@ def _select_option_from_efforts(model_id: str, current_effort: Optional[str]) ->
 
 def _select_option_sidekick(fam: dict, current: Optional[str]) -> dict:
     sks = (fam or {}).get("sidekicks") or []
+    labels = (fam or {}).get("sidekick_labels") or {}
     cur = current if current in sks else _default_sidekick(sks)
     return {
         "id": "sidekick",
@@ -1413,7 +1440,14 @@ def _select_option_sidekick(fam: dict, current: Optional[str]) -> dict:
         "category": "sidekick",
         "type": "select",
         "currentValue": cur or "",
-        "options": [{"value": s, "name": s, "description": ""} for s in sks],
+        "options": [
+            {
+                "value": s,
+                "name": (labels.get(s) or {}).get("name", s),
+                "description": (labels.get(s) or {}).get("description", ""),
+            }
+            for s in sks
+        ],
     }
 
 def get_cached_modes() -> List[dict]:

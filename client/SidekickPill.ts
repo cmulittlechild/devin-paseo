@@ -108,7 +108,7 @@ export function registerSidekickPills(client: PluginClientContext): () => void {
       }
       applyMenu(agentId, {
         value: info.sidekick,
-        options: info.options.map((id) => ({ id })),
+        options: info.options.map((o) => ({ id: o.id, label: o.label })),
       });
     } catch (error) {
       if (!pills.has(agentId)) return;

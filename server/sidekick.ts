@@ -37,7 +37,7 @@ function readJson(path: string): Record<string, unknown> | null {
 export function sidekickInfo(agentId: string): {
   fusion: boolean;
   sidekick: string | null;
-  options: string[];
+  options: { id: string; label: string; description?: string }[];
 } {
   const agent = findAgentFile(agentId);
   if (!agent) {
@@ -64,10 +64,18 @@ export function sidekickInfo(agentId: string): {
   const cache = readJson(join(supervisorDir(), "cache.json"));
   const families = (cache?.models ?? []) as Array<Record<string, unknown>>;
   const family = families.find((entry) => entry.id === familyId);
+  const labels = (family?.sidekick_labels ?? {}) as Record<
+    string,
+    { name?: string; description?: string }
+  >;
   const options = Array.isArray(family?.sidekicks)
-    ? (family.sidekicks as unknown[]).filter(
-        (v): v is string => typeof v === "string",
-      )
+    ? (family.sidekicks as unknown[])
+        .filter((v): v is string => typeof v === "string")
+        .map((id) => ({
+          id,
+          label: labels[id]?.name ?? id,
+          description: labels[id]?.description,
+        }))
     : [];
 
   const sidekick =
