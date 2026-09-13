@@ -1,5 +1,6 @@
 import type { PluginClientContext } from "@getpaseo/plugin/client";
 import { UsageStatsCard } from "./client/UsageStatsCard";
+import { registerSidekickPills } from "./client/SidekickPill";
 import { devinRestartDaemon } from "./shared/setup";
 import {
   USAGE_STATS_TITLE,
@@ -46,5 +47,8 @@ export default function contribute(client: PluginClientContext) {
       await rpc(devinRestartDaemon, {});
     },
   });
-  return () => {};
+  const removeSidekickPills = registerSidekickPills(client);
+  return () => {
+    removeSidekickPills();
+  };
 }
