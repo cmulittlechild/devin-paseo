@@ -2191,10 +2191,17 @@ class Turn:
     # Per-turn token accumulation: sum of this turn's model requests
     # (Devin Desktop "Response statistics" semantics — totals per user
     # message, not per session).
-    usage_key: tuple = ()
+    usage_seen: set = dataclasses.field(default_factory=set)
     usage_totals: dict = dataclasses.field(
         default_factory=lambda: {"input": 0, "output": 0, "cached": 0, "requests": 0}
     )
+    # Delegated-model usage (fusion sidekick / spawned subagents), keyed by
+    # subagent_context.parentAgentId — kept separate so the stats card can
+    # split lead vs sidekick consumption.
+    usage_sub_totals: dict = dataclasses.field(default_factory=dict)
+    # Subagent ids for which we synthesized a provider_subagent card this
+    # turn (fusion sidekick has no started/completed lifecycle events).
+    subagent_cards: set = dataclasses.field(default_factory=set)
 
     def is_cancelled(self) -> bool:
         return self.cancel_sent or self.phase == TurnPhase.CANCELLED
@@ -2537,6 +2544,22 @@ class Supervisor:
             lines.append(f"Cached tokens  {cached:,}")
         if requests:
             lines.append(f"Requests  {requests:,}")
+        # Delegated-model usage (fusion sidekick / subagents) — reported
+        # separately from the lead numbers above.
+        for _sid, _st in turn.usage_sub_totals.items():
+            _sr = _st.get("requests")
+            if not _sr:
+                continue
+            if _sid == "sidekick":
+                _label = f"Sidekick {(session or {}).get('sidekick') or ''}".rstrip()
+            else:
+                _nm = ((session or {}).get("subagentNames") or {}).get(_sid) or _sid
+                _label = f"Subagent {str(_nm)[:24]}"
+            lines.append(
+                f"{_label}  input {(_st.get('input') or 0) - (_st.get('cached') or 0):,} "
+                f"· output {(_st.get('output') or 0):,} "
+                f"· cached {(_st.get('cached') or 0):,} · {_sr:,} requests"
+            )
         # Session-wide cumulative line (all turns since session start).
         s_totals = (session or {}).get("usageTotals") or {}
         s_requests = s_totals.get("requests")
@@ -2568,6 +2591,27 @@ class Supervisor:
                 "content": {"type": "text", "text": "\n".join(lines)},
             }],
         })
+
+    def _finalize_subagent_cards(self, turn: "Turn") -> None:
+        """Turn end cleanup for synthesized subagent cards: Devin sends no
+        completion updates for delegated-model tool calls and no lifecycle
+        events for the fusion sidekick, so close out whatever is still
+        pending."""
+        _pend = getattr(turn, "subagent_pending_tool", None) or {}
+        for _sid, _tid in _pend.items():
+            self.send_notification(turn.external_session_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": _tid,
+                "status": "completed",
+                "_meta": {"paseo/subagentTimeline": _sid},
+            })
+        for _sid in getattr(turn, "subagent_cards", ()):
+            self.send_notification(turn.external_session_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": f"subcard-{_sid}",
+                "status": "completed",
+                "_meta": {"paseo/subagent": {"id": _sid, "status": "completed"}},
+            })
 
     def _prompt_result(self, external_session_id: str) -> dict:
         """Build the session/prompt result, attaching ACP usage when the native
@@ -3217,15 +3261,29 @@ class Supervisor:
                         _meta.get("cognition.ai/cachedReadTokens"),
                         update.get("used"),
                     )
-                    if _key != turn.usage_key and any(v is not None for v in _key):
-                        turn.usage_key = _key
-                        for _totals in (
-                            turn.usage_totals,
+                    if _key not in turn.usage_seen and any(v is not None for v in _key):
+                        turn.usage_seen.add(_key)
+                        # Devin tags delegated-model requests with
+                        # subagent_context.parentAgentId ("sidekick" for the
+                        # fusion sidekick, a hex id for spawned subagents,
+                        # "root"/absent for the lead). Keep lead vs delegated
+                        # consumption separate for the stats card.
+                        _sub_id = (_meta.get("cognition.ai/subagent_context") or {}).get("parentAgentId")
+                        _buckets = [turn.usage_totals]
+                        if _sub_id and _sub_id != "root":
+                            _buckets = [
+                                turn.usage_sub_totals.setdefault(
+                                    _sub_id,
+                                    {"input": 0, "output": 0, "cached": 0, "requests": 0},
+                                )
+                            ]
+                        _buckets.append(
                             _sess.setdefault(
                                 "usageTotals",
                                 {"input": 0, "output": 0, "cached": 0, "requests": 0},
-                            ),
-                        ):
+                            )
+                        )
+                        for _totals in _buckets:
                             _totals["input"] += _key[0] or 0
                             _totals["output"] += _key[1] or 0
                             _totals["cached"] += _key[2] or 0
@@ -3306,6 +3364,13 @@ class Supervisor:
                 info = sub_started or sub_completed or sub_failed
                 sub_id = info.get("agentId") or update.get("toolCallId")
                 if sub_id:
+                    _sess3 = self._get_session(turn.external_session_id)
+                    if _sess3 is not None:
+                        _names = _sess3.setdefault("subagentNames", {})
+                        _names.setdefault(
+                            sub_id,
+                            info.get("title") or info.get("profile") or sub_id,
+                        )
                     if sub_started:
                         status = "running"
                     elif sub_failed:
@@ -3350,6 +3415,25 @@ class Supervisor:
                     update["_meta"] = update_meta
             elif sub_ctx.get("parentAgentId"):
                 sub_id_ctx = sub_ctx["parentAgentId"]
+                # Fusion sidekick (and any subagent activity lacking a
+                # started event) needs an explicit card upsert — otherwise
+                # the timeline-routed tool calls have no card to live in.
+                if sub_id_ctx != "root" and sub_id_ctx not in turn.subagent_cards:
+                    turn.subagent_cards.add(sub_id_ctx)
+                    _sess2 = self._get_session(turn.external_session_id)
+                    _sk_model = (_sess2 or {}).get("sidekick") if sub_id_ctx == "sidekick" else None
+                    self.send_notification(turn.external_session_id, {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": f"subcard-{sub_id_ctx}",
+                        "status": "in_progress",
+                        "_meta": {"paseo/subagent": {
+                            "id": sub_id_ctx,
+                            "title": "Sidekick" if sub_id_ctx == "sidekick" else "Subagent",
+                            "description": "Delegated work" if sub_id_ctx == "sidekick" else None,
+                            "subtitle": _sk_model,
+                            "status": "running",
+                        }},
+                    })
                 update = dict(update)
                 update_meta = dict(meta)
                 update_meta["paseo/subagentTimeline"] = sub_id_ctx
@@ -4240,6 +4324,7 @@ class Supervisor:
         # Send result
         if not turn.result_sent:
             turn.result_sent = True
+            self._finalize_subagent_cards(turn)
             if turn.phase == TurnPhase.COMPLETED:
                 self._emit_usage_summary(turn)
                 self.send_result(turn.upstream_request_id, self._prompt_result(turn.external_session_id))
