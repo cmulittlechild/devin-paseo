@@ -1150,18 +1150,25 @@ def _model_family(model_id: str) -> str:
 
 
 def _resolve_model(base: str, effort: Optional[str]) -> str:
-    """Map (base family, effort) to a real Devin model id."""
+    """Map (base family, effort) to a real Devin model id.
+
+    Devin's concrete model ids use dashes inside version numbers
+    (family "gpt-5.6-luna" -> id "gpt-5-6-luna-max"), and effort-suffixed
+    ids are mandatory — a bare family name 404s with "Resource not found".
+    """
     if not base:
         return base
     fam = None
     for m in get_cached_models():
-        if m.get("id") == base:
+        mid = m.get("id")
+        if mid == base or (mid and mid.replace(".", "-") == base):
             fam = m
+            base = mid
             break
     efforts = (fam or {}).get("efforts") or []
     e = effort if effort in efforts else (DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else (efforts[0] if efforts else None))
     if e and e in EFFORTS:
-        return f"{base}-{e}"
+        return f"{base.replace('.', '-')}-{e}"
     return base
 
 
