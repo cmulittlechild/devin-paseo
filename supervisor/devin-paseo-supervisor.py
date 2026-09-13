@@ -3005,6 +3005,19 @@ class Supervisor:
                         is_empty=not preview.strip(),
                         output_preview=preview,
                     )
+            # Devin pushes config_option_update with only its own options
+            # (typically 2 items) which would REPLACE the session's
+            # configOptions in the Paseo adapter and drop our synthetic
+            # model/mode/effort selectors — re-merge them before forwarding.
+            if update.get("sessionUpdate") == "config_option_update":
+                _sess = self._get_session(turn.external_session_id)
+                if _sess is not None:
+                    update["configOptions"] = _merge_structured_config_options(
+                        update.get("configOptions"),
+                        _sess.get("model", "swe-2-medium"),
+                        _sess.get("mode", DEFAULT_DEVIN_MODE),
+                        feature_values=_sess.get("featureValues"),
+                    )
             # Buffer the last thought chunk so we can ensure the final
             # session/update before turn completion is never a thinking bubble.
             if update.get("sessionUpdate") == "agent_thought_chunk":
