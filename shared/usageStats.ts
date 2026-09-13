@@ -9,6 +9,10 @@ export const usageStatsData = z.object({
   thinkingTokens: z.number().optional(),
   cachedTokens: z.number().optional(),
   requests: z.number().optional(),
+  sessionInputTokens: z.number().optional(),
+  sessionOutputTokens: z.number().optional(),
+  sessionCachedTokens: z.number().optional(),
+  sessionRequests: z.number().optional(),
   contextUsed: z.number().optional(),
   contextSize: z.number().optional(),
   contextPercent: z.number().optional(),
@@ -60,6 +64,16 @@ export function parseUsageStatsText(text: string): UsageStatsData | undefined {
     m = line.match(/^Requests\s+([\d,]+)/);
     if (m) {
       data.requests = parseCount(m[1]);
+      continue;
+    }
+    m = line.match(
+      /^Session\s+input\s+([\d,]+)\s*·\s*output\s+([\d,]+)\s*·\s*cached\s+([\d,]+)\s*·\s*([\d,]+)\s*requests/,
+    );
+    if (m) {
+      data.sessionInputTokens = parseCount(m[1]);
+      data.sessionOutputTokens = parseCount(m[2]);
+      data.sessionCachedTokens = parseCount(m[3]);
+      data.sessionRequests = parseCount(m[4]);
       continue;
     }
     m = line.match(/^Context\s+([\d,]+)\s*\/\s*([\d,]+)\s*\((\d+)%\)/);

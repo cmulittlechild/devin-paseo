@@ -194,6 +194,17 @@ export function UsageStatsCard({
               />
             ) : null}
           </View>
+      {d.sessionRequests !== undefined ? (
+        <>
+          <View style={styles.divider} />
+          <Text style={styles.footer}>
+            {`Session  ${formatTokens(d.sessionInputTokens)} in · ` +
+              `${formatTokens(d.sessionOutputTokens)} out · ` +
+              `${formatTokens(d.sessionCachedTokens)} cached · ` +
+              `${formatTokens(d.sessionRequests)} requests`}
+          </Text>
+        </>
+      ) : null}
       {footerParts.length > 0 ? (
         <>
           <View style={styles.divider} />

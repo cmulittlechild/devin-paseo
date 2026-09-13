@@ -2302,6 +2302,17 @@ class Supervisor:
             lines.append(f"Cached tokens  {cached:,}")
         if requests:
             lines.append(f"Requests  {requests:,}")
+        # Session-wide cumulative line (all turns since session start).
+        s_totals = (session or {}).get("usageTotals") or {}
+        s_requests = s_totals.get("requests")
+        if s_requests:
+            s_in = s_totals.get("input") or 0
+            s_cached = s_totals.get("cached") or 0
+            lines.append(
+                "Session  "
+                f"input {s_in - s_cached:,} · output {(s_totals.get('output') or 0):,} "
+                f"· cached {s_cached:,} · {s_requests:,} requests"
+            )
         if used is not None:
             ctx = f"{used:,} / {size:,}" if size else f"{used:,}"
             if size:
@@ -2960,10 +2971,17 @@ class Supervisor:
                     )
                     if _key != turn.usage_key and any(v is not None for v in _key):
                         turn.usage_key = _key
-                        turn.usage_totals["input"] += _key[0] or 0
-                        turn.usage_totals["output"] += _key[1] or 0
-                        turn.usage_totals["cached"] += _key[2] or 0
-                        turn.usage_totals["requests"] += 1
+                        for _totals in (
+                            turn.usage_totals,
+                            _sess.setdefault(
+                                "usageTotals",
+                                {"input": 0, "output": 0, "cached": 0, "requests": 0},
+                            ),
+                        ):
+                            _totals["input"] += _key[0] or 0
+                            _totals["output"] += _key[1] or 0
+                            _totals["cached"] += _key[2] or 0
+                            _totals["requests"] += 1
             # Track tool results for grounding guardrail.
             # Only track on terminal status (completed/failed), not in_progress,
             # which is an intermediate chunk that may carry no content.
