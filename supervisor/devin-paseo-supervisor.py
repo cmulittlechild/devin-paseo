@@ -3413,8 +3413,17 @@ class Supervisor:
                     update_meta = dict(meta)
                     update_meta["paseo/subagent"] = payload
                     update["_meta"] = update_meta
-            elif sub_ctx.get("parentAgentId"):
-                sub_id_ctx = sub_ctx["parentAgentId"]
+            elif (
+                (sub_ctx.get("parentAgentId") or "root") != "root"
+                or meta.get("cognition.ai/sidekick")
+                or str(update.get("toolCallId") or "").startswith("sk::")
+            ):
+                sub_id_ctx = sub_ctx.get("parentAgentId")
+                if not sub_id_ctx or sub_id_ctx == "root":
+                    # Fusion sidekick tool calls carry only the
+                    # cognition.ai/sidekick marker (and sk::* ids), no
+                    # subagent_context — attribute them to the sidekick card.
+                    sub_id_ctx = "sidekick"
                 # Fusion sidekick (and any subagent activity lacking a
                 # started event) needs an explicit card upsert — otherwise
                 # the timeline-routed tool calls have no card to live in.
