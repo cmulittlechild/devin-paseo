@@ -2425,9 +2425,13 @@ class Supervisor:
             except Exception as exc:
                 _log(f"FORCE_MODE {method} failed real={real_sid} mode={mode} exc={exc}")
 
-    def _force_native_model(self, child: NativeChild, real_sid: str, model: Optional[str]) -> None:
+    def _force_native_model(self, child: NativeChild, real_sid: str, model: Optional[str], effort: Optional[str] = None) -> None:
         if not model:
             return
+        # Devin's set_config_option expects a full effort-suffixed id
+        # (e.g. "swe-2-max"); bare families like "swe-2" fail with
+        # "Resource not found".
+        model = _resolve_model(_model_family(model), _split_model_id(model)[1] or effort)
         req = {
             "jsonrpc": "2.0",
             "id": self.next_id(),
@@ -2865,7 +2869,7 @@ class Supervisor:
                     real_sid = new_res["result"]["sessionId"]
                     session["realId"] = real_sid
                     child.real_session_id = real_sid
-                    self._force_native_model(child, real_sid, session.get("model"))
+                    self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
                     self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
                     self._persist_session(turn.external_session_id)
                 else:
@@ -2903,7 +2907,7 @@ class Supervisor:
             load_res = self._send_rpc(child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
             if "result" in load_res:
                 child.real_session_id = real_sid
-                self._force_native_model(child, real_sid, session.get("model"))
+                self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
                 self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
                 _log(
                     f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_OK external={turn.external_session_id} "
@@ -2919,7 +2923,7 @@ class Supervisor:
                 turn.mark_failed()
                 return False
         turn.child = child
-        self._force_native_model(child, real_sid, session.get("model"))
+        self._force_native_model(child, real_sid, session.get("model"), session.get("effort"))
         self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
         if turn.is_cancelled():
             _log(f"NATIVE_PROMPT_CANCELLED_AFTER_CHILD external={turn.external_session_id} pid={child.proc.pid}")
@@ -3247,7 +3251,7 @@ class Supervisor:
                         load_res = self._send_rpc(resume_child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
                         if "result" in load_res:
                             _log(f"NATIVE_PROMPT RESUMED from sessions.db for external={turn.external_session_id} real={real_sid}")
-                            self._force_native_model(resume_child, real_sid, session.get("model"))
+                            self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"))
                             self._force_native_mode(resume_child, real_sid, DEFAULT_DEVIN_MODE)
                             self.pool.release(resume_child, real_sid)
                             turn.mark_failed()
@@ -3266,7 +3270,7 @@ class Supervisor:
                                 new_real_sid = new_res["result"]["sessionId"]
                                 session["realId"] = new_real_sid
                                 fresh_child.real_session_id = new_real_sid
-                                self._force_native_model(fresh_child, new_real_sid, session.get("model"))
+                                self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"))
                                 self._force_native_mode(fresh_child, new_real_sid, DEFAULT_DEVIN_MODE)
                                 self._persist_session(turn.external_session_id)
                                 self.pool.release(fresh_child, new_real_sid)
@@ -3645,7 +3649,7 @@ class Supervisor:
                     session["realId"] = real_id
                     child.real_session_id = real_id
                     # Apply model/mode
-                    self._force_native_model(child, real_id, session.get("model"))
+                    self._force_native_model(child, real_id, session.get("model"), session.get("effort"))
                     self._force_native_mode(child, real_id, DEFAULT_DEVIN_MODE)
                     result = dict(res["result"])
                     result["sessionId"] = external_id
@@ -3716,7 +3720,7 @@ class Supervisor:
                 if "result" in res:
                     _log(f"session/load OK for external={external_id} real={session['realId']}")
                     session["mode"] = DEFAULT_DEVIN_MODE
-                    self._force_native_model(child, session["realId"], session.get("model"))
+                    self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"))
                     self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
                     self.pool.release(child, session["realId"])
                     self.send_result(req_id, self._session_result(external_id, session))
@@ -3737,7 +3741,7 @@ class Supervisor:
                             if "result" in retry_res:
                                 _log(f"session/load RESUMED from sessions.db for external={external_id} real={session['realId']}")
                                 session["mode"] = DEFAULT_DEVIN_MODE
-                                self._force_native_model(child, session["realId"], session.get("model"))
+                                self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"))
                                 self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
                                 self.pool.release(child, session["realId"])
                                 self.send_result(req_id, self._session_result(external_id, session))
@@ -3764,7 +3768,7 @@ class Supervisor:
                             new_real_id = new_res["result"]["sessionId"]
                             session["realId"] = new_real_id
                             child.real_session_id = new_real_id
-                            self._force_native_model(child, new_real_id, session.get("model"))
+                            self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"))
                             self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
                             self.send_result(req_id, self._session_result(external_id, session))
                             self._persist_session(external_id)
@@ -3800,7 +3804,7 @@ class Supervisor:
                     new_real_id = new_res["result"]["sessionId"]
                     session["realId"] = new_real_id
                     child.real_session_id = new_real_id
-                    self._force_native_model(child, new_real_id, session.get("model"))
+                    self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"))
                     self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
                 else:
                     _log(f"session/load fresh create failed: {new_res.get('error')}")
