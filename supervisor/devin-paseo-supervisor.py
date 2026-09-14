@@ -2655,6 +2655,17 @@ class Supervisor:
             "params": {"sessionId": external_session_id, "update": update},
         })
 
+    def _emit_config_options(self, external_id: str, config_options) -> None:
+        # The adapter's unstable set_model path discards the response
+        # payload, leaving its cached configOptions stale (e.g. missing the
+        # sidekick select after switching to a fusion model) so a following
+        # setFeature fails with "does not expose ACP feature". Emitting this
+        # before the response guarantees the adapter applies it first.
+        self.send_notification(external_id, {
+            "sessionUpdate": "config_option_update",
+            "configOptions": config_options or [],
+        })
+
     def _send_parent_rpc(self, method: str, params: dict, timeout: float) -> dict:
         req_id = f"supervisor-{uuid.uuid4()}"
         q: queue.Queue = queue.Queue()
@@ -4535,6 +4546,7 @@ class Supervisor:
         else:
             _log(f"SET_MODE skipped: realId={session.get('realId')} mode_preference={self._mode_preference}")
         self.send_notification(external_id, {"sessionUpdate": "current_mode_update", "currentModeId": mode})
+        self._emit_config_options(external_id, self._session_result(external_id, session).get("configOptions"))
         self.send_result(req_id, {})
         self._persist_session(external_id)
 
@@ -4570,7 +4582,9 @@ class Supervisor:
                 self.pool.release(child)
         else:
             _log(f"SET_MODEL skipped: realId={session.get('realId')} mode_preference={self._mode_preference}")
-        self.send_result(req_id, self._session_result(external_id, session))
+        result = self._session_result(external_id, session)
+        self._emit_config_options(external_id, result.get("configOptions"))
+        self.send_result(req_id, result)
         self._persist_session(external_id)
 
 
@@ -4594,7 +4608,9 @@ class Supervisor:
             except Exception as exc:
                 _log(f"SET_EFFORT RPC failed real={session.get('realId')} model={model}: {exc}")
                 self.pool.release(child)
-        self.send_result(req_id, self._session_result(external_id, session))
+        result = self._session_result(external_id, session)
+        self._emit_config_options(external_id, result.get("configOptions"))
+        self.send_result(req_id, result)
         self._persist_session(external_id)
 
 
@@ -4619,7 +4635,9 @@ class Supervisor:
             except Exception as exc:
                 _log(f"SET_SIDEKICK RPC failed real={session.get('realId')} model={model}: {exc}")
                 self.pool.release(child)
-        self.send_result(req_id, self._session_result(external_id, session))
+        result = self._session_result(external_id, session)
+        self._emit_config_options(external_id, result.get("configOptions"))
+        self.send_result(req_id, result)
         self._persist_session(external_id)
 
 
@@ -4633,7 +4651,9 @@ class Supervisor:
             return
         if config_id:
             session.setdefault("featureValues", {})[config_id] = params.get("value")
-        self.send_result(req_id, self._session_result(external_id, session))
+        result = self._session_result(external_id, session)
+        self._emit_config_options(external_id, result.get("configOptions"))
+        self.send_result(req_id, result)
         self._persist_session(external_id)
 
     # ------------------------------------------------------------------
