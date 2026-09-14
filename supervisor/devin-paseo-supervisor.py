@@ -1228,6 +1228,15 @@ def _resolve_model(base: str, effort: Optional[str], sidekick: Optional[str] = N
     return base
 
 
+def _loop_family(session: dict) -> str:
+    """'fusion' when the session's resolved native model is a fusion pair."""
+    model = session.get("model") or ""
+    if model.startswith("fusion/") or model.startswith("fusion-"):
+        return "fusion"
+    fam = _family_for_model_id(model)
+    return "fusion" if (fam and fam.get("fusion")) else "regular"
+
+
 def _label_for_variant(fam: dict, model_id: str) -> Optional[str]:
     for label, mid in (fam.get("variant_map") or {}).items():
         if mid == model_id:
@@ -3146,6 +3155,43 @@ class Supervisor:
     # Native prompt execution
     # -----------------------------------------------------------------------
 
+    def _rearm_native_loop(self, external_id: str, session: dict) -> None:
+        """Re-initialize the native agent loop when the model family changed
+        since the loop was armed.
+
+        Fusion's sidekick tool and pairing attach at agent-loop init
+        (session/new or session/load), keyed to the model in effect at that
+        moment. A mid-loop set_config_option only swaps the model id — the
+        loop keeps its originally-armed toolset, so a session loaded as swe-2
+        never grows a sidekick after switching to fusion (and a fusion-armed
+        loop keeps stale fusion framing after switching away). Killing the
+        bound child makes the load-before-prompt path below rebuild the loop
+        on a fresh process; history is preserved in sessions.db.
+        """
+        real_sid = session.get("realId")
+        if not real_sid or self._mode_preference != "native":
+            return
+        want = _loop_family(session)
+        have = session.get("loop_family")
+        if have == want:
+            return
+        bound = None
+        with self.pool.lock:
+            for c in self.pool.children:
+                if c.real_session_id == real_sid and self.pool._is_alive(c):
+                    bound = c
+                    break
+        if bound is not None:
+            _log(
+                f"REARM_LOOP external={external_id} real={real_sid} "
+                f"pid={bound.proc.pid} family {have or 'unknown'} -> {want}"
+            )
+            self.pool.mark_dying(bound)
+            stale_lock_cleanup(real_sid, reclaim_orphan=True, reclaim_sibling=True)
+        # Force re-record at the load-before-prompt init below. When no child
+        # is bound, that path initializes the loop fresh anyway.
+        session["loop_family"] = None
+
     def _execute_native_prompt(self, turn: Turn, session: dict) -> bool:
         """Execute a prompt using native ACP mode. Returns True on success."""
         if turn.is_cancelled():
@@ -3170,6 +3216,7 @@ class Supervisor:
                     child.real_session_id = real_sid
                     self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
+                    session["loop_family"] = _loop_family(session)
                     self._persist_session(turn.external_session_id)
                 else:
                     _log(f"NATIVE_PROMPT fresh create failed: {new_res.get('error')}")
@@ -3182,6 +3229,7 @@ class Supervisor:
                 self.pool.release(child)
                 turn.mark_failed()
                 return False
+        self._rearm_native_loop(turn.external_session_id, session)
         child = self.pool.acquire(real_sid)
         if turn.is_cancelled():
             _log(f"NATIVE_PROMPT_CANCELLED_AFTER_ACQUIRE external={turn.external_session_id} pid={child.proc.pid}")
@@ -3208,6 +3256,7 @@ class Supervisor:
                 child.real_session_id = real_sid
                 self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                 self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
+                session["loop_family"] = _loop_family(session)
                 _log(
                     f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_OK external={turn.external_session_id} "
                     f"real={real_sid} pid={child.proc.pid}"
@@ -3602,6 +3651,7 @@ class Supervisor:
                             _log(f"NATIVE_PROMPT RESUMED from sessions.db for external={turn.external_session_id} real={real_sid}")
                             self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                             self._force_native_mode(resume_child, real_sid, DEFAULT_DEVIN_MODE)
+                            session["loop_family"] = _loop_family(session)
                             self.pool.release(resume_child, real_sid)
                             turn.mark_failed()
                             return False
@@ -3621,6 +3671,7 @@ class Supervisor:
                                 fresh_child.real_session_id = new_real_sid
                                 self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                                 self._force_native_mode(fresh_child, new_real_sid, DEFAULT_DEVIN_MODE)
+                                session["loop_family"] = _loop_family(session)
                                 self._persist_session(turn.external_session_id)
                                 self.pool.release(fresh_child, new_real_sid)
                                 turn.mark_failed()
@@ -4000,6 +4051,7 @@ class Supervisor:
                     # Apply model/mode
                     self._force_native_model(child, real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, real_id, DEFAULT_DEVIN_MODE)
+                    session["loop_family"] = _loop_family(session)
                     result = dict(res["result"])
                     result["sessionId"] = external_id
                     if isinstance(result.get("modes"), dict):
@@ -4072,6 +4124,7 @@ class Supervisor:
                     session["mode"] = DEFAULT_DEVIN_MODE
                     self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
+                    session["loop_family"] = _loop_family(session)
                     self.pool.release(child, session["realId"])
                     self.send_result(req_id, self._session_result(external_id, session))
                     self._persist_session(external_id)
@@ -4093,6 +4146,7 @@ class Supervisor:
                                 session["mode"] = DEFAULT_DEVIN_MODE
                                 self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
                                 self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
+                                session["loop_family"] = _loop_family(session)
                                 self.pool.release(child, session["realId"])
                                 self.send_result(req_id, self._session_result(external_id, session))
                                 self._persist_session(external_id)
@@ -4120,6 +4174,7 @@ class Supervisor:
                             child.real_session_id = new_real_id
                             self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                             self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
+                            session["loop_family"] = _loop_family(session)
                             self.send_result(req_id, self._session_result(external_id, session))
                             self._persist_session(external_id)
                             return
@@ -4156,6 +4211,7 @@ class Supervisor:
                     child.real_session_id = new_real_id
                     self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
+                    session["loop_family"] = _loop_family(session)
                 else:
                     _log(f"session/load fresh create failed: {new_res.get('error')}")
                 self.pool.release(child, session.get("realId"))
