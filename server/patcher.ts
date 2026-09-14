@@ -190,6 +190,35 @@ const PATCHES: Patch[] = [
             }));`,
   },
   {
+    // A persisted featureValue may outlive the feature that produced it:
+    // e.g. sidekick saved while the model was fusion stays in the agent
+    // record after switching back to a regular model. Replaying it through
+    // setFeature throws 'does not expose ACP feature' and fails the whole
+    // session load, so skip values whose select option the session does
+    // not currently expose.
+    id: "stale-feature-skip",
+    find: `        const configuredFeatureValues = this.config.featureValues ?? {};
+        for (const featureOption of this.configFeatureOptions) {
+            if (!Object.prototype.hasOwnProperty.call(configuredFeatureValues, featureOption.id)) {
+                continue;
+            }
+            await this.setFeature(featureOption.id, configuredFeatureValues[featureOption.id]);
+        }`,
+    replace: `        const configuredFeatureValues = this.config.featureValues ?? {};
+        for (const featureOption of this.configFeatureOptions) {
+            if (!Object.prototype.hasOwnProperty.call(configuredFeatureValues, featureOption.id)) {
+                continue;
+            }
+            // devin/stale-feature-skip
+            if (featureOption.id !== ACP_AUTO_ACCEPT_FEATURE_ID
+                && !findSelectConfigFeatureOption(this.configOptions, featureOption)) {
+                this.logger.warn({ featureId: featureOption.id }, this.provider + " skipping persisted feature not exposed by current config options");
+                continue;
+            }
+            await this.setFeature(featureOption.id, configuredFeatureValues[featureOption.id]);
+        }`,
+  },
+  {
     // Forward ACP usage_update notifications as usage_updated events.
     id: "usage-update",
     find: `    handleUsageUpdate(update) {
