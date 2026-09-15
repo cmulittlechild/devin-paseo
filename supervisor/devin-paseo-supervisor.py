@@ -1333,6 +1333,21 @@ def _label_for_variant(fam: dict, model_id: str) -> Optional[str]:
     return None
 
 
+def _sync_session_effort(session: dict, requested_effort: Optional[str]) -> None:
+    """Store the effort label actually encoded in the resolved model id.
+
+    _resolve_model may substitute a valid variant when the requested effort
+    isn't offered by the family (e.g. "medium" for glm-5.2 resolves to the
+    free high variant, "medium" for swe-2 resolves via the per-family
+    default). Storing the substituted label keeps session["effort"]
+    consistent with session["model"], so later reconciles and the config
+    options UI never report a level the model doesn't actually use."""
+    model = session.get("model") or ""
+    fam = _family_for_model_id(model) or _family_entry(_model_family(model))
+    label = _label_for_variant(fam, model) if fam else None
+    session["effort"] = label or requested_effort
+
+
 def _split_model_id(model_id: str) -> Tuple[str, Optional[str]]:
     fam = _family_for_model_id(model_id)
     if fam:
@@ -2855,6 +2870,7 @@ class Supervisor:
                 _eff = _default_effort_for_family(_fam)
             session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
             session["effort"] = _eff
+            _sync_session_effort(session, _eff)
             # Persist the actually-resolved sidekick — _resolve_model may
             # have substituted a valid default when the stored value isn't
             # offered by this fusion family.
@@ -3077,6 +3093,7 @@ class Supervisor:
                     "createdAt": time.time(),
                     "updatedAt": time.time(),
                 }
+                _sync_session_effort(session, _eff)
                 if _fm:
                     session["sidekick"] = _fm.group("sk")
                 elif (params or {}).get("sidekick"):
@@ -3097,6 +3114,7 @@ class Supervisor:
                         _eff = _default_effort_for_family(_fam)
                     session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
                     session["effort"] = _eff
+                    _sync_session_effort(session, _eff)
                     # Persist the actually-resolved sidekick — the stored
                     # value may not be offered by the new fusion family.
                     _m = _FUSION_ID_RE.match(session["model"] or "")
@@ -4786,6 +4804,7 @@ class Supervisor:
         _eff = tier or session.get("effort") or _default_effort_for_family(_fam)
         session["model"] = _resolve_model(base, _eff, session.get("sidekick"))
         session["effort"] = _eff
+        _sync_session_effort(session, _eff)
         # Persist the actually-resolved sidekick — the stored value may not
         # be offered by the newly-selected fusion family.
         _m = _FUSION_ID_RE.match(session["model"] or "")
@@ -4827,6 +4846,7 @@ class Supervisor:
         base, _ = _split_model_id(session.get("model") or "swe-2")
         session["effort"] = effort
         session["model"] = _resolve_model(base, effort, session.get("sidekick"))
+        _sync_session_effort(session, effort)
         # Persist the actually-resolved sidekick — the effort change may
         # have produced a different fusion combo.
         _m = _FUSION_ID_RE.match(session["model"] or "")
