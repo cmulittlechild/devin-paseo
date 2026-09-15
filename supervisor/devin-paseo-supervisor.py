@@ -330,9 +330,9 @@ DEVIN_MODELS = [
     {
         "id": "glm-5.2",
         "name": "GLM-5.2",
-        "description": "GLM-5.2 High  [200K context, Free]",
+        "description": "GLM-5.2 High  [200K context, Free — high effort only]",
         "efforts": [
-            "max"
+            "high"
         ]
     },
     {
@@ -1140,7 +1140,35 @@ def get_cached_models() -> List[dict]:
             continue
         seen.add(model_id)
         merged.append(model)
-    return merged
+    return _apply_model_effort_restrictions(merged)
+
+
+# Per-model effort restrictions. Only the free "high" tier is allowed for
+# GLM-5.2 — every other variant (max, none, 1m, …) is metered. Strip the
+# paid variants from efforts/variant_map/ids/descs so both the Paseo UI and
+# _resolve_model can never select a paid GLM-5.2 tier.
+_MODEL_EFFORT_RESTRICTIONS = {
+    "glm-5.2": {"high": "glm-5-2"},
+}
+
+
+def _apply_model_effort_restrictions(models: List[dict]) -> List[dict]:
+    result = []
+    for m in models:
+        model_id = m.get("id") or ""
+        restriction = _MODEL_EFFORT_RESTRICTIONS.get(model_id)
+        if not restriction:
+            result.append(m)
+            continue
+        m = dict(m)
+        allowed_ids = set(restriction.values())
+        m["efforts"] = list(restriction.keys())
+        vm = m.get("variant_map") or {}
+        m["variant_map"] = {k: v for k, v in vm.items() if k in restriction}
+        m["ids"] = [i for i in (m.get("ids") or []) if i in allowed_ids or i == model_id]
+        m["descs"] = {k: v for k, v in (m.get("descs") or {}).items() if k in allowed_ids or k == model_id}
+        result.append(m)
+    return result
 
 
 
@@ -3640,6 +3668,13 @@ class Supervisor:
                 err = result["error"]
                 msg = err.get("message", "Unknown error")
                 _log(f"NATIVE_PROMPT_ERROR id={turn.native_request_id} msg={msg}")
+                # Rate-limit errors are not retryable — every auto-resume
+                # restart sends a new API request that hits the same limit,
+                # burning through all retries in seconds with no chance of
+                # success. Report the error and stop retrying.
+                if "rate limit" in msg.lower():
+                    turn.fail_with_message(msg)
+                    return False
                 # If session not found, try to resume from sessions.db. For a persisted
                 # conversation, never replace the native session with a fresh one: that
                 # makes Paseo history visible but unavailable to the model.

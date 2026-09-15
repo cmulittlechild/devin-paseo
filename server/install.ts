@@ -50,18 +50,31 @@ export function ensureProviderConfig(commandPath: string): boolean {
   }
   const agents = (config.agents ?? {}) as Record<string, unknown>;
   const providers = (agents.providers ?? {}) as Record<string, unknown>;
+  // GLM-5.2's only unmetered tier is "high"; every other variant is billed.
+  // Pin the catalog entry to that single option so the UI can't offer (and
+  // the resolver can't select) a paid tier. additionalModels overrides the
+  // live catalog for this id and is re-applied on every install.
   const desired = {
     extends: "copilot",
     label: "Devin",
     command: [commandPath],
     enabled: true,
+    additionalModels: [
+      {
+        id: "glm-5.2",
+        label: "GLM-5.2",
+        thinkingOptions: [{ id: "high", label: "High", isDefault: true }],
+      },
+    ],
   };
   const current = providers[PROVIDER_ID] as Record<string, unknown> | undefined;
   const already =
     current &&
     current.enabled === true &&
     Array.isArray(current.command) &&
-    current.command[0] === commandPath;
+    current.command[0] === commandPath &&
+    JSON.stringify(current.additionalModels ?? null) ===
+      JSON.stringify(desired.additionalModels);
   if (already) {
     return false;
   }
