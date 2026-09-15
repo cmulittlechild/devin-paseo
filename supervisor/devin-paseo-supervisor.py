@@ -574,7 +574,8 @@ DEVIN_MODELS = [
     {
         "id": "swe-2",
         "name": "SWE-2",
-        "description": "SWE-2 Medium  [262K context, Free]",
+        "description": "SWE-2 Max  [262K context, Free]",
+        "default_effort": "max",
         "efforts": [
             "medium",
             "high",
@@ -1177,6 +1178,26 @@ _EFFORT_SUFFIX_RE = re.compile(r'-(none|minimal|low|medium|high|xhigh|max|thinki
 DEFAULT_EFFORT = "medium"
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
+# Per-family default effort overrides. Keys are family ids (dash-normalized).
+# When a family doesn't declare its own default_effort, this table is
+# consulted before falling back to DEFAULT_EFFORT.
+_FAMILY_DEFAULT_EFFORT: dict = {
+    "swe-2": "max",
+}
+
+
+def _default_effort_for_family(fam: Optional[dict]) -> str:
+    """Per-family default effort (e.g. swe-2 -> max). Falls back to
+    DEFAULT_EFFORT when the family doesn't declare one."""
+    if fam:
+        de = fam.get("default_effort")
+        if de and de in EFFORTS:
+            return de
+        fid = fam.get("id") or ""
+        if fid in _FAMILY_DEFAULT_EFFORT:
+            return _FAMILY_DEFAULT_EFFORT[fid]
+    return DEFAULT_EFFORT
+
 _FUSION_ID_RE = re.compile(
     r'^fusion-(?P<lead>.+?)-(?P<eff>none|minimal|low|medium|high|xhigh|max)(?P<fast>-fast)?-sidekick-(?P<sk>.+)$'
 )
@@ -1238,7 +1259,8 @@ def _resolve_model(base: str, effort: Optional[str], sidekick: Optional[str] = N
     fam = _family_entry(base) or _family_for_model_id(base)
     if fam and fam.get("fusion"):
         pairs = fam.get("pairs") or {}
-        eff = effort if effort in pairs else (DEFAULT_EFFORT if DEFAULT_EFFORT in pairs else next(iter(pairs), None))
+        _def = _default_effort_for_family(fam)
+        eff = effort if effort in pairs else (_def if _def in pairs else next(iter(pairs), None))
         sks = pairs.get(eff) or {}
         sk = sidekick if sidekick in sks else _default_sidekick(list(sks))
         return sks.get(sk) or next(iter(sks.values()), base)
@@ -1247,10 +1269,12 @@ def _resolve_model(base: str, effort: Optional[str], sidekick: Optional[str] = N
         # already-concrete id with no new effort requested -> keep it
         if base in vm.values() and (not effort or effort == _label_for_variant(fam, base)):
             return base
-        eff = effort if effort in vm else (DEFAULT_EFFORT if DEFAULT_EFFORT in vm else next(iter(vm)))
+        _def = _default_effort_for_family(fam)
+        eff = effort if effort in vm else (_def if _def in vm else next(iter(vm)))
         return vm.get(eff) or base
     efforts = (fam or {}).get("efforts") or []
-    e = effort if effort in efforts else (DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else (efforts[0] if efforts else None))
+    _def = _default_effort_for_family(fam)
+    e = effort if effort in efforts else (_def if _def in efforts else (efforts[0] if efforts else None))
     if e and e in EFFORTS:
         return f"{base.replace('.', '-')}-{e}"
     return base
@@ -1456,7 +1480,7 @@ def _select_option_from_efforts(model_id: str, current_effort: Optional[str]) ->
     fam = _family_for_model_id(model_id) or _family_entry(_model_family(model_id))
     efforts = (fam or {}).get("efforts") or list(EFFORTS)
     options = [{"value": e, "name": e.title(), "description": ""} for e in efforts]
-    cur = current_effort or (DEFAULT_EFFORT if DEFAULT_EFFORT in efforts else efforts[0])
+    cur = current_effort or (_default_effort_for_family(fam) if _default_effort_for_family(fam) in efforts else efforts[0])
     return {
         "id": "effort",
         "name": "Effort",
@@ -2787,7 +2811,17 @@ class Supervisor:
                 f"SESSION_CONFIG_RECONCILE external={external_id} "
                 f"model {session.get('model')} -> {requested_model}"
             )
-            session["model"] = requested_model
+            # Split into base + tier; preserve the session's existing
+            # effort when the agent file carries a bare family id
+            # (e.g. "swe-2" without "-max"), otherwise adopt the tier
+            # encoded in the requested model id.
+            _base, _tier = _split_model_id(requested_model)
+            _eff = _tier or session.get("effort")
+            if _eff is None:
+                _fam = _family_entry(_model_family(requested_model))
+                _eff = _default_effort_for_family(_fam)
+            session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
+            session["effort"] = _eff
         requested_mode = _agent_requested_mode(params)
         if requested_mode and requested_mode != DEFAULT_DEVIN_MODE:
             _log(f"SESSION_CONFIG_RECONCILE external={external_id} requested_mode={requested_mode} forced={DEFAULT_DEVIN_MODE}")
@@ -2987,11 +3021,14 @@ class Supervisor:
         with self.lock:
             session = self.sessions.get(external_id)
             if not session:
+                _fam = _family_entry(_model_family((params or {}).get("model", "swe-2")))
+                _eff = (params or {}).get("effort") or _default_effort_for_family(_fam)
                 session = {
                     "externalId": external_id,
                     "realId": None,
                     "cwd": (params or {}).get("cwd", str(Path.home())),
-                    "model": _resolve_model(_model_family((params or {}).get("model", "swe-2")), (params or {}).get("effort") or DEFAULT_EFFORT, (params or {}).get("sidekick")),
+                    "model": _resolve_model(_model_family((params or {}).get("model", "swe-2")), _eff, (params or {}).get("sidekick")),
+                    "effort": _eff,
                     "mode": DEFAULT_DEVIN_MODE,
                     "title": None,
                     "createdAt": time.time(),
@@ -3004,7 +3041,15 @@ class Supervisor:
                     session["cwd"] = params["cwd"]
                 if params.get("model"):
                     _pm = params["model"] if params["model"].startswith("fusion/") else params["model"].split("/",1)[-1]
-                    session["model"] = _resolve_model(_model_family(_pm), _split_model_id(_pm)[1], session.get("sidekick"))
+                    _base, _tier = _split_model_id(_pm)
+                    # Preserve the current effort when the model switch
+                    # doesn't carry an explicit tier (e.g. bare "swe-2").
+                    _eff = _tier or session.get("effort")
+                    if _eff is None:
+                        _fam = _family_entry(_model_family(_pm))
+                        _eff = _default_effort_for_family(_fam)
+                    session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
+                    session["effort"] = _eff
                 session["mode"] = DEFAULT_DEVIN_MODE
                 session["updatedAt"] = time.time()
             return session
@@ -4666,8 +4711,10 @@ class Supervisor:
         if "/" in model and not model.startswith("fusion/"):
             model = model.split("/", 1)[1]
         base, tier = _split_model_id(model)
-        session["model"] = _resolve_model(base, tier or session.get("effort"), session.get("sidekick"))
-        session["effort"] = tier or session.get("effort") or DEFAULT_EFFORT
+        _fam = _family_entry(_model_family(base))
+        _eff = tier or session.get("effort") or _default_effort_for_family(_fam)
+        session["model"] = _resolve_model(base, _eff, session.get("sidekick"))
+        session["effort"] = _eff
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
             child = self.pool.acquire(session["realId"])
@@ -4694,7 +4741,10 @@ class Supervisor:
         if not session:
             self.send_error(req_id, -32001, f"Unknown session '{external_id}'")
             return
-        effort = params.get("value") or params.get("effort") or DEFAULT_EFFORT
+        effort = params.get("value") or params.get("effort")
+        if not effort:
+            _fam = _family_for_model_id(session.get("model") or "swe-2") or _family_entry(_model_family(session.get("model") or "swe-2"))
+            effort = _default_effort_for_family(_fam)
         base, _ = _split_model_id(session.get("model") or "swe-2")
         session["effort"] = effort
         session["model"] = _resolve_model(base, effort, session.get("sidekick"))
