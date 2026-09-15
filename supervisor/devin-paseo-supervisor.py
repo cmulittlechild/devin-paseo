@@ -3229,6 +3229,13 @@ class Supervisor:
                 self.pool.release(child)
                 turn.mark_failed()
                 return False
+        # Re-write this agent's MCP config before any native child
+        # (re-)spawn. The .devin/mcp_config.local.json file is shared
+        # across all agents in the same cwd; a sibling agent's
+        # session/new may have overwritten it with its own
+        # callerAgentId. Writing here ensures the native child reads
+        # *this* agent's MCP entry when it starts/reloads.
+        _write_devin_mcp_config(session.get("cwd"), session.get("mcp_servers"))
         self._rearm_native_loop(turn.external_session_id, session)
         child = self.pool.acquire(real_sid)
         if turn.is_cancelled():
@@ -4035,6 +4042,7 @@ class Supervisor:
         external_id = str(uuid.uuid4())
         session = self._ensure_session(external_id, params)
         self._reconcile_session_config(external_id, session, params)
+        session["mcp_servers"] = params.get("mcpServers")
         _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
         # In native mode, create a real session
         if self._mode_preference == "native":
@@ -4100,6 +4108,7 @@ class Supervisor:
                 if native.get("cwd") and not (params or {}).get("cwd"):
                     session["cwd"] = native["cwd"]
         self._reconcile_session_config(external_id, session, params)
+        session["mcp_servers"] = params.get("mcpServers")
         _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
         # Replay history BEFORE the native session/load RPC. Paseo's ACP client
         # sets replayingHistory=true before calling loadSession, and collects
