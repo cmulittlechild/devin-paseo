@@ -49,6 +49,7 @@ DEVIN_SUPERVISOR_NUDGE_IDLE_SECONDS       Nudge threshold (default: 300)
   DEVIN_SUPERVISOR_MAX_CHILDREN             (default: 5)
 """
 import collections
+import contextlib
 import dataclasses
 import enum
 import fcntl
@@ -889,6 +890,38 @@ def _with_flock(lock_path: Path, mutator):
                 os.chmod(lock_path, 0o600)
             except OSError:
                 pass
+
+
+@contextlib.contextmanager
+def _mcp_config_lock(cwd: Optional[str]):
+    """Hold an exclusive flock on .devin/mcp_config.local.json for the
+    write+session_init sequence.
+
+    .devin/mcp_config.local.json is shared across all agents in the same
+    cwd — each agent's paseo MCP entry carries its own callerAgentId, so
+    a sibling agent's write between our write and our session_init would
+    give the native child the wrong identity. Serializing the sequence
+    per-cwd eliminates that race; agents in different cwds use different
+    lock files and are unaffected."""
+    if not cwd:
+        yield
+        return
+    lock_path = Path(cwd) / ".devin" / "mcp_config.local.json.lock"
+    ensure_private_dir(lock_path.parent)
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        lock_file.close()
+        try:
+            os.chmod(lock_path, 0o600)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -2701,7 +2734,7 @@ class Supervisor:
 
     def _session_result(self, external_id: str, session: dict) -> dict:
         session["mode"] = DEFAULT_DEVIN_MODE
-        model = session.get("model", "swe-1-6")
+        model = session.get("model", "swe-2-medium")
         return {
             "sessionId": external_id,
             "modes": {"currentModeId": DEFAULT_DEVIN_MODE, "availableModes": get_cached_modes()},
@@ -2822,6 +2855,12 @@ class Supervisor:
                 _eff = _default_effort_for_family(_fam)
             session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
             session["effort"] = _eff
+            # Persist the actually-resolved sidekick — _resolve_model may
+            # have substituted a valid default when the stored value isn't
+            # offered by this fusion family.
+            _m = _FUSION_ID_RE.match(session["model"] or "")
+            if _m and _m.group("sk") != session.get("sidekick"):
+                session["sidekick"] = _m.group("sk")
         requested_mode = _agent_requested_mode(params)
         if requested_mode and requested_mode != DEFAULT_DEVIN_MODE:
             _log(f"SESSION_CONFIG_RECONCILE external={external_id} requested_mode={requested_mode} forced={DEFAULT_DEVIN_MODE}")
@@ -3023,17 +3062,25 @@ class Supervisor:
             if not session:
                 _fam = _family_entry(_model_family((params or {}).get("model", "swe-2")))
                 _eff = (params or {}).get("effort") or _default_effort_for_family(_fam)
+                _resolved_model = _resolve_model(_model_family((params or {}).get("model", "swe-2")), _eff, (params or {}).get("sidekick"))
+                # Extract the actually-resolved sidekick from the fusion model
+                # id so session["sidekick"] always reflects what was used.
+                _fm = _FUSION_ID_RE.match(_resolved_model or "")
                 session = {
                     "externalId": external_id,
                     "realId": None,
                     "cwd": (params or {}).get("cwd", str(Path.home())),
-                    "model": _resolve_model(_model_family((params or {}).get("model", "swe-2")), _eff, (params or {}).get("sidekick")),
+                    "model": _resolved_model,
                     "effort": _eff,
                     "mode": DEFAULT_DEVIN_MODE,
                     "title": None,
                     "createdAt": time.time(),
                     "updatedAt": time.time(),
                 }
+                if _fm:
+                    session["sidekick"] = _fm.group("sk")
+                elif (params or {}).get("sidekick"):
+                    session["sidekick"] = (params or {}).get("sidekick")
                 self.sessions[external_id] = session
                 _log(f"SESSION_CREATE external={external_id}")
             elif params:
@@ -3050,6 +3097,11 @@ class Supervisor:
                         _eff = _default_effort_for_family(_fam)
                     session["model"] = _resolve_model(_base, _eff, session.get("sidekick"))
                     session["effort"] = _eff
+                    # Persist the actually-resolved sidekick — the stored
+                    # value may not be offered by the new fusion family.
+                    _m = _FUSION_ID_RE.match(session["model"] or "")
+                    if _m and _m.group("sk") != session.get("sidekick"):
+                        session["sidekick"] = _m.group("sk")
                 session["mode"] = DEFAULT_DEVIN_MODE
                 session["updatedAt"] = time.time()
             return session
@@ -3271,85 +3323,89 @@ class Supervisor:
             _log(f"NATIVE_PROMPT_CANCELLED_BEFORE_START external={turn.external_session_id}")
             return False
         real_sid = session.get("realId")
-        # If no realId, create a fresh native session first
-        if not real_sid:
-            if self._requires_real_resume(turn.external_session_id, session):
-                msg = self._continuity_error(turn.external_session_id, session, "missing native session id")
-                _log(f"NATIVE_PROMPT_CONTINUITY_REFUSED external={turn.external_session_id} reason=missing_realId")
-                turn.fail_with_message(msg)
+        # Acquire the per-cwd MCP config lock for the write+session_init
+        # sequence. .devin/mcp_config.local.json is shared across all
+        # agents in the same cwd; a sibling agent's write between our
+        # write and the native child's session_init read would give the
+        # child the wrong callerAgentId. Holding the lock through
+        # session_init eliminates that race.
+        with _mcp_config_lock(session.get("cwd")):
+            # Re-write this agent's MCP config before any native child
+            # (re-)spawn. Writing inside the lock ensures no sibling can
+            # overwrite it before our session_init reads it.
+            _write_devin_mcp_config(session.get("cwd"), session.get("mcp_servers"))
+            # If no realId, create a fresh native session first
+            if not real_sid:
+                if self._requires_real_resume(turn.external_session_id, session):
+                    msg = self._continuity_error(turn.external_session_id, session, "missing native session id")
+                    _log(f"NATIVE_PROMPT_CONTINUITY_REFUSED external={turn.external_session_id} reason=missing_realId")
+                    turn.fail_with_message(msg)
+                    return False
+                _log(f"NATIVE_PROMPT no realId, creating fresh for external={turn.external_session_id}")
+                child = self.pool.acquire()
+                try:
+                    new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
+                    new_res = self._send_rpc(child, new_req, timeout=30)
+                    if "result" in new_res:
+                        real_sid = new_res["result"]["sessionId"]
+                        session["realId"] = real_sid
+                        child.real_session_id = real_sid
+                        self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
+                        self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
+                        session["loop_family"] = _loop_family(session)
+                        self._persist_session(turn.external_session_id)
+                    else:
+                        _log(f"NATIVE_PROMPT fresh create failed: {new_res.get('error')}")
+                        self.pool.release(child)
+                        turn.mark_failed()
+                        return False
+                    self.pool.release(child, real_sid)
+                except Exception as exc:
+                    _log(f"NATIVE_PROMPT fresh create error: {exc}")
+                    self.pool.release(child)
+                    turn.mark_failed()
+                    return False
+            self._rearm_native_loop(turn.external_session_id, session)
+            child = self.pool.acquire(real_sid)
+            if turn.is_cancelled():
+                _log(f"NATIVE_PROMPT_CANCELLED_AFTER_ACQUIRE external={turn.external_session_id} pid={child.proc.pid}")
+                self.pool.release(child, child.real_session_id)
                 return False
-            _log(f"NATIVE_PROMPT no realId, creating fresh for external={turn.external_session_id}")
-            child = self.pool.acquire()
-            try:
-                new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
-                new_res = self._send_rpc(child, new_req, timeout=30)
-                if "result" in new_res:
-                    real_sid = new_res["result"]["sessionId"]
-                    session["realId"] = real_sid
+            if child.real_session_id != real_sid:
+                _log(
+                    f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT external={turn.external_session_id} "
+                    f"real={real_sid} pid={child.proc.pid} previous={child.real_session_id}"
+                )
+                stale_lock_cleanup(real_sid, reclaim_orphan=True, reclaim_sibling=True)
+                load_req = {
+                    "jsonrpc": "2.0",
+                    "id": self.next_id(),
+                    "method": "session/load",
+                    "params": {
+                        "sessionId": real_sid,
+                        "cwd": session.get("cwd", str(Path.home())),
+                        "mcpServers": [],
+                    },
+                }
+                load_res = self._send_rpc(child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
+                if "result" in load_res:
                     child.real_session_id = real_sid
                     self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
                     self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
                     session["loop_family"] = _loop_family(session)
-                    self._persist_session(turn.external_session_id)
+                    _log(
+                        f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_OK external={turn.external_session_id} "
+                        f"real={real_sid} pid={child.proc.pid}"
+                    )
                 else:
-                    _log(f"NATIVE_PROMPT fresh create failed: {new_res.get('error')}")
-                    self.pool.release(child)
+                    err_msg = load_res.get("error", {}).get("message", "session/load failed")
+                    _log(
+                        f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_ERROR external={turn.external_session_id} "
+                        f"real={real_sid} pid={child.proc.pid} msg={err_msg}"
+                    )
+                    self.pool.mark_dying(child)
                     turn.mark_failed()
                     return False
-                self.pool.release(child, real_sid)
-            except Exception as exc:
-                _log(f"NATIVE_PROMPT fresh create error: {exc}")
-                self.pool.release(child)
-                turn.mark_failed()
-                return False
-        # Re-write this agent's MCP config before any native child
-        # (re-)spawn. The .devin/mcp_config.local.json file is shared
-        # across all agents in the same cwd; a sibling agent's
-        # session/new may have overwritten it with its own
-        # callerAgentId. Writing here ensures the native child reads
-        # *this* agent's MCP entry when it starts/reloads.
-        _write_devin_mcp_config(session.get("cwd"), session.get("mcp_servers"))
-        self._rearm_native_loop(turn.external_session_id, session)
-        child = self.pool.acquire(real_sid)
-        if turn.is_cancelled():
-            _log(f"NATIVE_PROMPT_CANCELLED_AFTER_ACQUIRE external={turn.external_session_id} pid={child.proc.pid}")
-            self.pool.release(child, child.real_session_id)
-            return False
-        if child.real_session_id != real_sid:
-            _log(
-                f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT external={turn.external_session_id} "
-                f"real={real_sid} pid={child.proc.pid} previous={child.real_session_id}"
-            )
-            stale_lock_cleanup(real_sid, reclaim_orphan=True, reclaim_sibling=True)
-            load_req = {
-                "jsonrpc": "2.0",
-                "id": self.next_id(),
-                "method": "session/load",
-                "params": {
-                    "sessionId": real_sid,
-                    "cwd": session.get("cwd", str(Path.home())),
-                    "mcpServers": [],
-                },
-            }
-            load_res = self._send_rpc(child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
-            if "result" in load_res:
-                child.real_session_id = real_sid
-                self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
-                self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
-                session["loop_family"] = _loop_family(session)
-                _log(
-                    f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_OK external={turn.external_session_id} "
-                    f"real={real_sid} pid={child.proc.pid}"
-                )
-            else:
-                err_msg = load_res.get("error", {}).get("message", "session/load failed")
-                _log(
-                    f"NATIVE_PROMPT_LOAD_BEFORE_PROMPT_ERROR external={turn.external_session_id} "
-                    f"real={real_sid} pid={child.proc.pid} msg={err_msg}"
-                )
-                self.pool.mark_dying(child)
-                turn.mark_failed()
-                return False
         turn.child = child
         self._force_native_model(child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
         self._force_native_mode(child, real_sid, DEFAULT_DEVIN_MODE)
@@ -3726,48 +3782,53 @@ class Supervisor:
                 if "not found" in msg.lower() or "unknown session" in msg.lower() or "already open" in msg.lower():
                     _log(f"NATIVE_PROMPT session lost, attempting resume for external={turn.external_session_id}")
                     self.pool.mark_dying(child)
-                    # Try stale lock cleanup + session/load to resume from sessions.db.
-                    # reclaim_orphan=True to reclaim locks held by a live devin acp
-                    # child of a previous supervisor instance.
-                    stale_lock_cleanup(real_sid, reclaim_orphan=True, reclaim_sibling=True)
-                    resume_child = self.pool.acquire()
-                    try:
-                        load_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": real_sid, "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
-                        load_res = self._send_rpc(resume_child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
-                        if "result" in load_res:
-                            _log(f"NATIVE_PROMPT RESUMED from sessions.db for external={turn.external_session_id} real={real_sid}")
-                            self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
-                            self._force_native_mode(resume_child, real_sid, DEFAULT_DEVIN_MODE)
-                            session["loop_family"] = _loop_family(session)
-                            self.pool.release(resume_child, real_sid)
-                            turn.mark_failed()
-                            return False
-                        self.pool.release(resume_child)
-                    except Exception as exc_resume:
-                        _log(f"NATIVE_PROMPT resume attempt error: {exc_resume}")
-                        self.pool.release(resume_child)
-                    if not self._requires_real_resume(turn.external_session_id, session):
-                        _log(f"NATIVE_PROMPT fresh retry allowed external={turn.external_session_id} old_real={real_sid} reason={msg}")
-                        fresh_child = self.pool.acquire()
+                    # Re-acquire the per-cwd MCP config lock for the recovery
+                    # session_init — a sibling agent may have overwritten the
+                    # config since our initial write.
+                    with _mcp_config_lock(session.get("cwd")):
+                        _write_devin_mcp_config(session.get("cwd"), session.get("mcp_servers"))
+                        # Try stale lock cleanup + session/load to resume from sessions.db.
+                        # reclaim_orphan=True to reclaim locks held by a live devin acp
+                        # child of a previous supervisor instance.
+                        stale_lock_cleanup(real_sid, reclaim_orphan=True, reclaim_sibling=True)
+                        resume_child = self.pool.acquire()
                         try:
-                            new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
-                            new_res = self._send_rpc(fresh_child, new_req, timeout=30)
-                            if "result" in new_res:
-                                new_real_sid = new_res["result"]["sessionId"]
-                                session["realId"] = new_real_sid
-                                fresh_child.real_session_id = new_real_sid
-                                self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
-                                self._force_native_mode(fresh_child, new_real_sid, DEFAULT_DEVIN_MODE)
+                            load_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": real_sid, "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
+                            load_res = self._send_rpc(resume_child, load_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
+                            if "result" in load_res:
+                                _log(f"NATIVE_PROMPT RESUMED from sessions.db for external={turn.external_session_id} real={real_sid}")
+                                self._force_native_model(resume_child, real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
+                                self._force_native_mode(resume_child, real_sid, DEFAULT_DEVIN_MODE)
                                 session["loop_family"] = _loop_family(session)
-                                self._persist_session(turn.external_session_id)
-                                self.pool.release(fresh_child, new_real_sid)
+                                self.pool.release(resume_child, real_sid)
                                 turn.mark_failed()
                                 return False
-                            _log(f"NATIVE_PROMPT fresh retry create failed external={turn.external_session_id}: {new_res.get('error')}")
-                            self.pool.release(fresh_child)
-                        except Exception as exc_fresh:
-                            _log(f"NATIVE_PROMPT fresh retry error external={turn.external_session_id}: {exc_fresh}")
-                            self.pool.release(fresh_child)
+                            self.pool.release(resume_child)
+                        except Exception as exc_resume:
+                            _log(f"NATIVE_PROMPT resume attempt error: {exc_resume}")
+                            self.pool.release(resume_child)
+                        if not self._requires_real_resume(turn.external_session_id, session):
+                            _log(f"NATIVE_PROMPT fresh retry allowed external={turn.external_session_id} old_real={real_sid} reason={msg}")
+                            fresh_child = self.pool.acquire()
+                            try:
+                                new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
+                                new_res = self._send_rpc(fresh_child, new_req, timeout=30)
+                                if "result" in new_res:
+                                    new_real_sid = new_res["result"]["sessionId"]
+                                    session["realId"] = new_real_sid
+                                    fresh_child.real_session_id = new_real_sid
+                                    self._force_native_model(fresh_child, new_real_sid, session.get("model"), session.get("effort"), session.get("sidekick"))
+                                    self._force_native_mode(fresh_child, new_real_sid, DEFAULT_DEVIN_MODE)
+                                    session["loop_family"] = _loop_family(session)
+                                    self._persist_session(turn.external_session_id)
+                                    self.pool.release(fresh_child, new_real_sid)
+                                    turn.mark_failed()
+                                    return False
+                                _log(f"NATIVE_PROMPT fresh retry create failed external={turn.external_session_id}: {new_res.get('error')}")
+                                self.pool.release(fresh_child)
+                            except Exception as exc_fresh:
+                                _log(f"NATIVE_PROMPT fresh retry error external={turn.external_session_id}: {exc_fresh}")
+                                self.pool.release(fresh_child)
                     msg = self._continuity_error(turn.external_session_id, session, msg)
                     _log(f"NATIVE_PROMPT_CONTINUITY_REFUSED external={turn.external_session_id} real={real_sid}")
                     turn.fail_with_message(msg)
@@ -4123,48 +4184,52 @@ class Supervisor:
         session = self._ensure_session(external_id, params)
         self._reconcile_session_config(external_id, session, params)
         session["mcp_servers"] = params.get("mcpServers")
-        _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
-        # In native mode, create a real session
-        if self._mode_preference == "native":
-            child = self.pool.acquire()
-            try:
-                real_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
-                if session["mode"]:
-                    real_req["params"]["mode"] = session["mode"]
-                res = self._send_rpc(child, real_req, timeout=30)
-                if "result" in res:
-                    real_id = res["result"].get("sessionId")
-                    session["realId"] = real_id
-                    child.real_session_id = real_id
-                    # Apply model/mode
-                    self._force_native_model(child, real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
-                    self._force_native_mode(child, real_id, DEFAULT_DEVIN_MODE)
-                    session["loop_family"] = _loop_family(session)
-                    result = dict(res["result"])
-                    result["sessionId"] = external_id
-                    if isinstance(result.get("modes"), dict):
-                        result["modes"]["currentModeId"] = DEFAULT_DEVIN_MODE
-                    native_options = result.get("configOptions") if isinstance(result.get("configOptions"), list) else []
-                    result["configOptions"] = _merge_structured_config_options(
-                        native_options,
-                        session.get("model", "swe-2-medium"),
-                        DEFAULT_DEVIN_MODE,
-                        feature_values=session.get("featureValues"),
-                        sidekick=session.get("sidekick"),
-                    )
-                    result["models"] = _acp_model_state(session.get("model", "swe-2-medium"))
-                    self._persist_session(external_id)
-                    self.pool.release(child, real_id)
-                    self.send_result(req_id, result)
-                    return
-                else:
-                    child.real_session_id = None
+        # In native mode, create a real session under the MCP config lock —
+        # .devin/mcp_config.local.json is shared per-cwd and the native child
+        # reads it during session/new, so the write must stay valid until
+        # the child has consumed it.
+        with _mcp_config_lock(session.get("cwd")):
+            _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
+            if self._mode_preference == "native":
+                child = self.pool.acquire()
+                try:
+                    real_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
+                    if session["mode"]:
+                        real_req["params"]["mode"] = session["mode"]
+                    res = self._send_rpc(child, real_req, timeout=30)
+                    if "result" in res:
+                        real_id = res["result"].get("sessionId")
+                        session["realId"] = real_id
+                        child.real_session_id = real_id
+                        # Apply model/mode
+                        self._force_native_model(child, real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
+                        self._force_native_mode(child, real_id, DEFAULT_DEVIN_MODE)
+                        session["loop_family"] = _loop_family(session)
+                        result = dict(res["result"])
+                        result["sessionId"] = external_id
+                        if isinstance(result.get("modes"), dict):
+                            result["modes"]["currentModeId"] = DEFAULT_DEVIN_MODE
+                        native_options = result.get("configOptions") if isinstance(result.get("configOptions"), list) else []
+                        result["configOptions"] = _merge_structured_config_options(
+                            native_options,
+                            session.get("model", "swe-2-medium"),
+                            DEFAULT_DEVIN_MODE,
+                            feature_values=session.get("featureValues"),
+                            sidekick=session.get("sidekick"),
+                        )
+                        result["models"] = _acp_model_state(session.get("model", "swe-2-medium"))
+                        self._persist_session(external_id)
+                        self.pool.release(child, real_id)
+                        self.send_result(req_id, result)
+                        return
+                    else:
+                        child.real_session_id = None
+                        self.pool.release(child)
+                        # Fall through to synthetic session
+                except Exception as exc:
+                    _log(f"session/new native error: {exc}")
                     self.pool.release(child)
                     # Fall through to synthetic session
-            except Exception as exc:
-                _log(f"session/new native error: {exc}")
-                self.pool.release(child)
-                # Fall through to synthetic session
         # Synthetic session (print-mode or native fallback)
         self.send_result(req_id, {
             "sessionId": external_id,
@@ -4189,124 +4254,130 @@ class Supervisor:
                     session["cwd"] = native["cwd"]
         self._reconcile_session_config(external_id, session, params)
         session["mcp_servers"] = params.get("mcpServers")
-        _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
-        # Replay history BEFORE the native session/load RPC. Paseo's ACP client
-        # sets replayingHistory=true before calling loadSession, and collects
-        # session/update notifications into persistedHistory during the wait.
-        # Notifications must arrive DURING this wait to be collected. If they
-        # arrive after the result, replayingHistory is false and they bypass
-        # persistedHistory, causing streamHistory() to return empty.
-        self._replay_history(external_id)
-        # If we have a realId and native mode, try to load it
-        if session.get("realId") and self._mode_preference == "native":
-            # Clean up stale lock files from dead Devin processes (e.g. after reboot)
-            # reclaim_orphan=True also reclaims locks held by live devin acp
-            # processes that belong to a previous/replaced supervisor stdio
-            # instance (Paseo does not always tear down the old stdio on reload).
-            stale_lock_cleanup(session["realId"], reclaim_orphan=True)
-            child = self.pool.acquire(session["realId"])
-            try:
-                real_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": session["realId"], "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
-                res = self._send_rpc(child, real_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
-                if "result" in res:
-                    _log(f"session/load OK for external={external_id} real={session['realId']}")
-                    session["mode"] = DEFAULT_DEVIN_MODE
-                    self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
-                    self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
-                    session["loop_family"] = _loop_family(session)
-                    self.pool.release(child, session["realId"])
-                    self.send_result(req_id, self._session_result(external_id, session))
-                    self._persist_session(external_id)
-                    return
-                else:
-                    err = res.get("error", {})
-                    msg = err.get("message", "")
-                    _log(f"session/load ERROR for external={external_id} real={session['realId']} msg={msg}")
-                    if "already open" in msg.lower() or "another process" in msg.lower():
-                        # Try removing stale lock and retrying session/load.
-                        # reclaim_orphan=True to reclaim locks held by a live
-                        # devin acp child of a previous supervisor instance.
-                        if stale_lock_cleanup(session["realId"], reclaim_orphan=True, reclaim_sibling=True):
-                            _log(f"session/load retry after lock cleanup for external={external_id}")
-                            retry_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": session["realId"], "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
-                            retry_res = self._send_rpc(child, retry_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
-                            if "result" in retry_res:
-                                _log(f"session/load RESUMED from sessions.db for external={external_id} real={session['realId']}")
-                                session["mode"] = DEFAULT_DEVIN_MODE
-                                self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
-                                self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
-                                session["loop_family"] = _loop_family(session)
+        # Hold the per-cwd MCP config lock through the write + session_init
+        # sequence. .devin/mcp_config.local.json is shared per-cwd and the
+        # native child reads it during session/load or session/new, so a
+        # sibling agent's write between our write and the child's read would
+        # give the child the wrong callerAgentId.
+        with _mcp_config_lock(session.get("cwd")):
+            _write_devin_mcp_config(session.get("cwd"), params.get("mcpServers"))
+            # Replay history BEFORE the native session/load RPC. Paseo's ACP client
+            # sets replayingHistory=true before calling loadSession, and collects
+            # session/update notifications into persistedHistory during the wait.
+            # Notifications must arrive DURING this wait to be collected. If they
+            # arrive after the result, replayingHistory is false and they bypass
+            # persistedHistory, causing streamHistory() to return empty.
+            self._replay_history(external_id)
+            # If we have a realId and native mode, try to load it
+            if session.get("realId") and self._mode_preference == "native":
+                # Clean up stale lock files from dead Devin processes (e.g. after reboot)
+                # reclaim_orphan=True also reclaims locks held by live devin acp
+                # processes that belong to a previous/replaced supervisor stdio
+                # instance (Paseo does not always tear down the old stdio on reload).
+                stale_lock_cleanup(session["realId"], reclaim_orphan=True)
+                child = self.pool.acquire(session["realId"])
+                try:
+                    real_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": session["realId"], "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
+                    res = self._send_rpc(child, real_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
+                    if "result" in res:
+                        _log(f"session/load OK for external={external_id} real={session['realId']}")
+                        session["mode"] = DEFAULT_DEVIN_MODE
+                        self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
+                        self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
+                        session["loop_family"] = _loop_family(session)
+                        self.pool.release(child, session["realId"])
+                        self.send_result(req_id, self._session_result(external_id, session))
+                        self._persist_session(external_id)
+                        return
+                    else:
+                        err = res.get("error", {})
+                        msg = err.get("message", "")
+                        _log(f"session/load ERROR for external={external_id} real={session['realId']} msg={msg}")
+                        if "already open" in msg.lower() or "another process" in msg.lower():
+                            # Try removing stale lock and retrying session/load.
+                            # reclaim_orphan=True to reclaim locks held by a live
+                            # devin acp child of a previous supervisor instance.
+                            if stale_lock_cleanup(session["realId"], reclaim_orphan=True, reclaim_sibling=True):
+                                _log(f"session/load retry after lock cleanup for external={external_id}")
+                                retry_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/load", "params": {"sessionId": session["realId"], "cwd": session.get("cwd", str(Path.home())), "mcpServers": []}}
+                                retry_res = self._send_rpc(child, retry_req, timeout=SESSION_LOAD_TIMEOUT_SECONDS)
+                                if "result" in retry_res:
+                                    _log(f"session/load RESUMED from sessions.db for external={external_id} real={session['realId']}")
+                                    session["mode"] = DEFAULT_DEVIN_MODE
+                                    self._force_native_model(child, session["realId"], session.get("model"), session.get("effort"), session.get("sidekick"))
+                                    self._force_native_mode(child, session["realId"], DEFAULT_DEVIN_MODE)
+                                    session["loop_family"] = _loop_family(session)
+                                    self.pool.release(child, session["realId"])
+                                    self.send_result(req_id, self._session_result(external_id, session))
+                                    self._persist_session(external_id)
+                                    return
+                                retry_err = retry_res.get("error", {}).get("message", "")
+                                _log(f"session/load retry failed: {retry_err}")
+                            # Fall through to fresh session creation
+                        if "already open" in msg.lower() or "another process" in msg.lower() or "not found" in msg.lower() or "unknown session" in msg.lower() or "invalid params" in msg.lower() or "timeout" in msg.lower():
+                            if self._requires_real_resume(external_id, session):
                                 self.pool.release(child, session["realId"])
+                                err_msg = self._continuity_error(external_id, session, msg or "session/load failed")
+                                _log(f"session/load CONTINUITY_REFUSED external={external_id} real={session['realId']} msg={msg}")
+                                self.send_error(req_id, -32013, err_msg, external_id)
+                                self._persist_session(external_id)
+                                return
+                            # Create fresh native session
+                            _log(f"session/load creating fresh for external={external_id}")
+                            self.pool.release(child, session["realId"])
+                            child = self.pool.acquire()
+                            new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
+                            new_res = self._send_rpc(child, new_req, timeout=30)
+                            if "result" in new_res:
+                                new_real_id = new_res["result"]["sessionId"]
+                                session["realId"] = new_real_id
+                                child.real_session_id = new_real_id
+                                self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
+                                self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
+                                session["loop_family"] = _loop_family(session)
                                 self.send_result(req_id, self._session_result(external_id, session))
                                 self._persist_session(external_id)
                                 return
-                            retry_err = retry_res.get("error", {}).get("message", "")
-                            _log(f"session/load retry failed: {retry_err}")
-                        # Fall through to fresh session creation
-                    if "already open" in msg.lower() or "another process" in msg.lower() or "not found" in msg.lower() or "unknown session" in msg.lower() or "invalid params" in msg.lower() or "timeout" in msg.lower():
-                        if self._requires_real_resume(external_id, session):
+                            self.pool.release(child)
+                        else:
+                            # Catch-all: release the child for any other error
+                            # (e.g. timeout) to prevent resource leak.
+                            _log(f"session/load unhandled error, releasing child for external={external_id} msg={msg}")
                             self.pool.release(child, session["realId"])
-                            err_msg = self._continuity_error(external_id, session, msg or "session/load failed")
-                            _log(f"session/load CONTINUITY_REFUSED external={external_id} real={session['realId']} msg={msg}")
-                            self.send_error(req_id, -32013, err_msg, external_id)
-                            self._persist_session(external_id)
-                            return
-                        # Create fresh native session
-                        _log(f"session/load creating fresh for external={external_id}")
-                        self.pool.release(child, session["realId"])
-                        child = self.pool.acquire()
-                        new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
-                        new_res = self._send_rpc(child, new_req, timeout=30)
-                        if "result" in new_res:
-                            new_real_id = new_res["result"]["sessionId"]
-                            session["realId"] = new_real_id
-                            child.real_session_id = new_real_id
-                            self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
-                            self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
-                            session["loop_family"] = _loop_family(session)
-                            self.send_result(req_id, self._session_result(external_id, session))
-                            self._persist_session(external_id)
-                            return
-                        self.pool.release(child)
-                    else:
-                        # Catch-all: release the child for any other error
-                        # (e.g. timeout) to prevent resource leak.
-                        _log(f"session/load unhandled error, releasing child for external={external_id} msg={msg}")
-                        self.pool.release(child, session["realId"])
-            except Exception as exc:
-                _log(f"session/load native error: {exc}")
-                self.pool.release(child)
+                except Exception as exc:
+                    _log(f"session/load native error: {exc}")
+                    self.pool.release(child)
+                    if self._requires_real_resume(external_id, session):
+                        err_msg = self._continuity_error(external_id, session, str(exc))
+                        self.send_error(req_id, -32013, err_msg, external_id)
+                        self._persist_session(external_id)
+                        return
+            elif not session.get("realId") and self._mode_preference == "native":
                 if self._requires_real_resume(external_id, session):
-                    err_msg = self._continuity_error(external_id, session, str(exc))
+                    err_msg = self._continuity_error(external_id, session, "missing native session id")
+                    _log(f"session/load CONTINUITY_REFUSED external={external_id} reason=missing_realId")
                     self.send_error(req_id, -32013, err_msg, external_id)
                     self._persist_session(external_id)
                     return
-        elif not session.get("realId") and self._mode_preference == "native":
-            if self._requires_real_resume(external_id, session):
-                err_msg = self._continuity_error(external_id, session, "missing native session id")
-                _log(f"session/load CONTINUITY_REFUSED external={external_id} reason=missing_realId")
-                self.send_error(req_id, -32013, err_msg, external_id)
-                self._persist_session(external_id)
-                return
-            # No realId (new stdio process, state not recovered) — create a fresh native session
-            _log(f"session/load no realId, creating fresh native for external={external_id}")
-            child = self.pool.acquire()
-            try:
-                new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
-                new_res = self._send_rpc(child, new_req, timeout=30)
-                if "result" in new_res:
-                    new_real_id = new_res["result"]["sessionId"]
-                    session["realId"] = new_real_id
-                    child.real_session_id = new_real_id
-                    self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
-                    self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
-                    session["loop_family"] = _loop_family(session)
-                else:
-                    _log(f"session/load fresh create failed: {new_res.get('error')}")
-                self.pool.release(child, session.get("realId"))
-            except Exception as exc:
-                _log(f"session/load fresh create error: {exc}")
-                self.pool.release(child)
+                # No realId (new stdio process, state not recovered) — create a fresh native session
+                _log(f"session/load no realId, creating fresh native for external={external_id}")
+                child = self.pool.acquire()
+                try:
+                    new_req = {"jsonrpc": "2.0", "id": self.next_id(), "method": "session/new", "params": {"cwd": session["cwd"], "mcpServers": params.get("mcpServers", [])}}
+                    new_res = self._send_rpc(child, new_req, timeout=30)
+                    if "result" in new_res:
+                        new_real_id = new_res["result"]["sessionId"]
+                        session["realId"] = new_real_id
+                        child.real_session_id = new_real_id
+                        self._force_native_model(child, new_real_id, session.get("model"), session.get("effort"), session.get("sidekick"))
+                        self._force_native_mode(child, new_real_id, DEFAULT_DEVIN_MODE)
+                        session["loop_family"] = _loop_family(session)
+                    else:
+                        _log(f"session/load fresh create failed: {new_res.get('error')}")
+                    self.pool.release(child, session.get("realId"))
+                except Exception as exc:
+                    _log(f"session/load fresh create error: {exc}")
+                    self.pool.release(child)
         self.send_result(req_id, self._session_result(external_id, session))
         self._persist_session(external_id)
 
@@ -4715,6 +4786,14 @@ class Supervisor:
         _eff = tier or session.get("effort") or _default_effort_for_family(_fam)
         session["model"] = _resolve_model(base, _eff, session.get("sidekick"))
         session["effort"] = _eff
+        # Persist the actually-resolved sidekick — the stored value may not
+        # be offered by the newly-selected fusion family.
+        _m = _FUSION_ID_RE.match(session["model"] or "")
+        if _m and _m.group("sk") != session.get("sidekick"):
+            session["sidekick"] = _m.group("sk")
+        elif not _m:
+            # Non-fusion model — clear the stale sidekick.
+            session.pop("sidekick", None)
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
             child = self.pool.acquire(session["realId"])
@@ -4748,6 +4827,11 @@ class Supervisor:
         base, _ = _split_model_id(session.get("model") or "swe-2")
         session["effort"] = effort
         session["model"] = _resolve_model(base, effort, session.get("sidekick"))
+        # Persist the actually-resolved sidekick — the effort change may
+        # have produced a different fusion combo.
+        _m = _FUSION_ID_RE.match(session["model"] or "")
+        if _m and _m.group("sk") != session.get("sidekick"):
+            session["sidekick"] = _m.group("sk")
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
             child = self.pool.acquire(session["realId"])
@@ -4775,6 +4859,12 @@ class Supervisor:
         session["sidekick"] = params.get("value") or params.get("sidekick")
         base, tier = _split_model_id(session.get("model") or "")
         session["model"] = _resolve_model(base, tier or session.get("effort"), session["sidekick"])
+        # Persist the actually-resolved sidekick — _resolve_model may have
+        # substituted a valid default when the requested value isn't offered
+        # by this fusion family.
+        _m = _FUSION_ID_RE.match(session["model"] or "")
+        if _m and _m.group("sk") != session["sidekick"]:
+            session["sidekick"] = _m.group("sk")
         model = session["model"]
         if session.get("realId") and self._mode_preference == "native":
             child = self.pool.acquire(session["realId"])
